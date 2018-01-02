@@ -50,6 +50,7 @@ type HTTPRequest struct {
 	body           io.ReadWriter         // reader for the request's body
 	into           interface{}           // pointer to a variable where the response will be loaded into
 	headersInto    map[string]*string    // map of header names to pointers where response header values will be loaded into
+	statusInto     *int                  // pointer where response status code will be loaded
 	expectedStatus int                   // expected status code from the server (defaults to 200)
 	err            error                 // error encountered during building the request
 	authType       authType              // authentication type for the request (defaults to no authentication)
@@ -152,6 +153,11 @@ func (req *HTTPRequest) HeaderInto(header string, into *string) *HTTPRequest {
 		req.headersInto = make(map[string]*string)
 	}
 	req.headersInto[header] = into
+	return req
+}
+
+func (req *HTTPRequest) StatusInto(into *int) *HTTPRequest {
+	req.statusInto = into
 	return req
 }
 
@@ -277,6 +283,11 @@ func (req *HTTPRequest) Run() error {
 		for key, into := range req.headersInto {
 			*into = res.Header.Get(key)
 		}
+	}
+
+	// do we need to return the status code?
+	if req.statusInto != nil {
+		*req.statusInto = res.StatusCode
 	}
 
 	// did the response return with the expected status code? if not,
