@@ -2,10 +2,12 @@ package requests
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -29,6 +31,7 @@ const (
 type HTTPClient struct {
 	baseURL       string                // base URL for all HTTP requests
 	httpCli       *http.Client          // underlying net/http client
+	noTLSVerify   bool                  // are we verifying TLS certificates?
 	authType      authType              // default authentication type for all requests (defaults to no authentication)
 	authUser      string                // default username for all requests
 	authPass      string                // default password for all requests
@@ -75,6 +78,7 @@ func (cli *HTTPClient) Accept(accept string) *HTTPClient {
 }
 
 func (cli *HTTPClient) Timeout(dur time.Duration) *HTTPClient {
+	// nil out existing HTTP client
 	cli.timeout = dur
 	return cli
 }
@@ -100,10 +104,38 @@ func (cli *HTTPClient) ErrorHandler(handler func(io.Reader) error) *HTTPClient {
 	return cli
 }
 
+func (cli *HTTPClient) NoTLSVerify(enabled bool) *HTTPClient {
+	// nil out existing HTTP client
+	cli.httpCli = nil
+	cli.noTLSVerify = enabled
+	return cli
+}
+
 func (cli *HTTPClient) NewRequest(method, path string) *HTTPRequest {
 	if cli.httpCli == nil {
+		tlsConfig := &tls.Config{InsecureSkipVerify: cli.noTLSVerify}
+
+		// this is a modification of Golang's default HTTP transport
+		// (https://golang.org/pkg/net/http/#RoundTripper) to ignore
+		// invalid certificates (note that this is using go 1.6's
+		// default transport, there are more configurations in 1.7)
+		var transport http.RoundTripper = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+				DualStack: true,
+			}).DialContext,
+			MaxIdleConns:          10,
+			IdleConnTimeout:       60 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			TLSClientConfig:       tlsConfig,
+		}
+
 		cli.httpCli = &http.Client{
-			Timeout: cli.timeout,
+			Timeout:   cli.timeout,
+			Transport: transport,
 		}
 	}
 

@@ -105,3 +105,19 @@ func TestErrorResponse(t *testing.T) {
 		t.Errorf("Failed reading non-200 status code: got %d, expected %d", status, http.StatusBadRequest)
 	}
 }
+
+func TestNoTLSVerify(t *testing.T) {
+	cli := NewClient("")
+	cli.NewRequest("GET", "/")
+
+	transport := cli.httpCli.Transport.(*http.Transport)
+	if transport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("Transport should verify TLS connections but isn't")
+	}
+
+	cli.NoTLSVerify(true).NewRequest("GET", "/")
+	transport = cli.httpCli.Transport.(*http.Transport)
+	if !transport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("Transport shouldn't verify TLS connections but is")
+	}
+}
