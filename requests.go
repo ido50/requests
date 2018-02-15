@@ -49,11 +49,13 @@ type HTTPRequest struct {
 	method         string                // HTTP method/verb to use (GET, POST, PUT, etc.)
 	path           string                // request path (will be appended to the client's base URL)
 	queryParams    url.Values            // URL query parameters for the request
+	cookies        []*http.Cookie        // cookies to send with the HTTP request
 	contentType    string                // content type of the request's body
 	body           io.ReadWriter         // reader for the request's body
 	into           interface{}           // pointer to a variable where the response will be loaded into
 	headersInto    map[string]*string    // map of header names to pointers where response header values will be loaded into
 	statusInto     *int                  // pointer where response status code will be loaded
+	cookiesInto    *[]*http.Cookie       // pointer where response cookies will be loaded
 	expectedStatus int                   // expected status code from the server (defaults to 200)
 	err            error                 // error encountered during building the request
 	authType       authType              // authentication type for the request (defaults to no authentication)
@@ -154,6 +156,11 @@ func (req *HTTPRequest) QueryParam(key, value string) *HTTPRequest {
 	return req
 }
 
+func (req *HTTPRequest) Cookie(cookie *http.Cookie) *HTTPRequest {
+	req.cookies = append(req.cookies, cookie)
+	return req
+}
+
 func (req *HTTPRequest) Body(body []byte, contentType string) *HTTPRequest {
 	req.body = bytes.NewBuffer(body)
 	req.contentType = contentType
@@ -190,6 +197,11 @@ func (req *HTTPRequest) HeaderInto(header string, into *string) *HTTPRequest {
 
 func (req *HTTPRequest) StatusInto(into *int) *HTTPRequest {
 	req.statusInto = into
+	return req
+}
+
+func (req *HTTPRequest) CookiesInto(into *[]*http.Cookie) *HTTPRequest {
+	req.cookiesInto = into
 	return req
 }
 
@@ -243,6 +255,11 @@ func (req *HTTPRequest) Run() error {
 	r, err := http.NewRequest(req.method, reqURL, req.body)
 	if err != nil {
 		return errors.Wrap(err, "failed creating request")
+	}
+
+	// add cookies
+	for _, c := range req.cookies {
+		r.AddCookie(c)
 	}
 
 	// are we using basic authentication?
@@ -320,6 +337,10 @@ func (req *HTTPRequest) Run() error {
 	// do we need to return the status code?
 	if req.statusInto != nil {
 		*req.statusInto = res.StatusCode
+	}
+
+	if req.cookiesInto != nil {
+		*req.cookiesInto = res.Cookies()
 	}
 
 	// did the response return with the expected status code? if not,
