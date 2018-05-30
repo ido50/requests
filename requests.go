@@ -57,7 +57,7 @@ type HTTPRequest struct {
 	queryParams    url.Values            // URL query parameters for the request
 	cookies        []*http.Cookie        // cookies to send with the HTTP request
 	contentType    string                // content type of the request's body
-	body           io.ReadWriter         // reader for the request's body
+	body           []byte                // reader for the request's body
 	into           interface{}           // pointer to a variable where the response will be loaded into
 	headersInto    map[string]*string    // map of header names to pointers where response header values will be loaded into
 	statusInto     *int                  // pointer where response status code will be loaded
@@ -182,6 +182,7 @@ func (cli *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 		context.Background(),
 		cli.logger,
 		req,
+		nil,
 		cli.timeout,
 		cli.retryLimit+1,
 	)
@@ -191,6 +192,7 @@ func (cli *HTTPClient) retryRequest(
 	parentCtx context.Context,
 	logger *zap.Logger,
 	req *http.Request,
+	body []byte,
 	timeout time.Duration,
 	attempts uint8,
 ) (res *http.Response, err error) {
@@ -207,6 +209,10 @@ func (cli *HTTPClient) retryRequest(
 	delay := 2 * time.Second
 
 	for attempt := uint8(1); attempt <= attempts; attempt++ {
+		if body != nil {
+			req.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+		}
+
 		res, err = cli.doRequest(parentCtx, req, timeout)
 		// we retry requests if an error is returned from net/http, or if
 		// the status of the response is 502, 503 or 504, which are all proxy
@@ -284,14 +290,14 @@ func (req *HTTPRequest) Cookie(cookie *http.Cookie) *HTTPRequest {
 }
 
 func (req *HTTPRequest) Body(body []byte, contentType string) *HTTPRequest {
-	req.body = bytes.NewBuffer(body)
+	req.body = body
 	req.contentType = contentType
 	return req
 }
 
 func (req *HTTPRequest) JSONBody(body interface{}) *HTTPRequest {
-	req.body = &bytes.Buffer{}
-	err := json.NewEncoder(req.body).Encode(body)
+	var err error
+	req.body, err = json.Marshal(body)
 	if err != nil {
 		req.err = errors.Wrap(err, "failed processing JSON body")
 	}
@@ -401,7 +407,7 @@ func (req *HTTPRequest) RunContext(ctx context.Context) error {
 	}
 
 	// create the net/http.Request object
-	r, err := http.NewRequest(req.method, reqURL, req.body)
+	r, err := http.NewRequest(req.method, reqURL, nil)
 	if err != nil {
 		return errors.Wrap(err, "failed creating request")
 	}
@@ -477,7 +483,7 @@ func (req *HTTPRequest) RunContext(ctx context.Context) error {
 	}
 
 	// run the request
-	res, err := req.cli.retryRequest(ctx, req.logger, r, timeout, attempts)
+	res, err := req.cli.retryRequest(ctx, req.logger, r, req.body, timeout, attempts)
 	if err != nil {
 		if err == ErrTimeoutReached {
 			return err
@@ -595,7 +601,6 @@ func DefaultTransport(tlsNoVerify bool) http.RoundTripper {
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second, // time spent performing the TLS handshake
-		ResponseHeaderTimeout: 10 * time.Second, // time spent reading the headers of the response
 		ExpectContinueTimeout: 1 * time.Second,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: tlsNoVerify,
