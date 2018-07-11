@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,8 @@ import (
 
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+
+	"log"
 )
 
 type authType string
@@ -46,6 +49,9 @@ type HTTPClient struct {
 	errorHandler  func(io.Reader) error // default error handler for all requests returning unexpected status
 	bodyHandler   BodyHandlerFunc       // default body handler for requests (when Content-Type is not automatically handled by this library)
 	logger        *zap.Logger           // logger to use (only debug messages are printed by the library; defaults to noop logger)
+	certPEMBlock  []byte
+	keyPEMBlock   []byte
+	caCert        []byte
 }
 
 // HTTPRequest represents a single HTTP request to the web service defined
@@ -177,6 +183,14 @@ func (cli *HTTPClient) NewRequest(method, path string) *HTTPRequest {
 	}
 }
 
+func (cli *HTTPClient) SetTLS(certPEMBlock, keyPEMBlock, caCert []byte) *HTTPClient {
+	cli.caCert = caCert
+	cli.keyPEMBlock = keyPEMBlock
+	cli.certPEMBlock = certPEMBlock
+
+	return cli
+}
+
 func (cli *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 	return cli.retryRequest(
 		context.Background(),
@@ -197,8 +211,14 @@ func (cli *HTTPClient) retryRequest(
 	attempts uint8,
 ) (res *http.Response, err error) {
 	if cli.httpCli == nil {
-		cli.httpCli = &http.Client{
-			Transport: DefaultTransport(cli.noTLSVerify),
+		if cli.certPEMBlock == nil {
+			cli.httpCli = &http.Client{
+				Transport: DefaultTransport(cli.noTLSVerify),
+			}
+		} else {
+			cli.httpCli = &http.Client{
+				Transport: TLSTransport(cli.certPEMBlock, cli.keyPEMBlock, cli.caCert),
+			}
 		}
 	}
 
@@ -247,8 +267,14 @@ func (cli *HTTPClient) doRequest(
 	timeout time.Duration,
 ) (res *http.Response, err error) {
 	if cli.httpCli == nil {
-		cli.httpCli = &http.Client{
-			Transport: DefaultTransport(cli.noTLSVerify),
+		if cli.certPEMBlock == nil {
+			cli.httpCli = &http.Client{
+				Transport: DefaultTransport(cli.noTLSVerify),
+			}
+		} else {
+			cli.httpCli = &http.Client{
+				Transport: TLSTransport(cli.certPEMBlock, cli.keyPEMBlock, cli.caCert),
+			}
 		}
 	}
 
@@ -591,6 +617,41 @@ func DefaultTransport(tlsNoVerify bool) http.RoundTripper {
 	// timeouts.
 	// see https://blog.cloudflare.com/the-complete-guide-to-golang-net-http-timeouts/
 	// for more details about client timeouts
+
+	var tlsConfig *tls.Config
+	tlsConfig = &tls.Config{
+		InsecureSkipVerify: tlsNoVerify,
+	}
+
+	var transport http.RoundTripper = buildTransport(tlsConfig)
+	return transport
+}
+
+func TLSTransport(certPEMBlock, keyPEMBlock, caCert []byte) http.RoundTripper {
+
+	// Load client Certificate
+	cert, err := tls.X509KeyPair(certPEMBlock, keyPEMBlock)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+
+	var tlsConfig *tls.Config
+	// Setup HTTPS client
+	tlsConfig = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      caCertPool,
+	}
+	tlsConfig.BuildNameToCertificate()
+
+	var transport http.RoundTripper = buildTransport(tlsConfig)
+	return transport
+}
+
+func buildTransport(tlsconfig *tls.Config) http.RoundTripper {
+
 	var transport http.RoundTripper = &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -602,10 +663,7 @@ func DefaultTransport(tlsNoVerify bool) http.RoundTripper {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second, // time spent performing the TLS handshake
 		ExpectContinueTimeout: 1 * time.Second,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: tlsNoVerify,
-		},
+		TLSClientConfig:       tlsconfig,
 	}
-
 	return transport
 }
