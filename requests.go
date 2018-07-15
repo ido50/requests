@@ -217,7 +217,7 @@ func (cli *HTTPClient) retryRequest(
 			}
 		} else {
 			cli.httpCli = &http.Client{
-				Transport: TLSTransport(cli.certPEMBlock, cli.keyPEMBlock, cli.caCert),
+				Transport: TLSTransport(cli.certPEMBlock, cli.keyPEMBlock, cli.caCert,cli.noTLSVerify),
 			}
 		}
 	}
@@ -273,7 +273,7 @@ func (cli *HTTPClient) doRequest(
 			}
 		} else {
 			cli.httpCli = &http.Client{
-				Transport: TLSTransport(cli.certPEMBlock, cli.keyPEMBlock, cli.caCert),
+				Transport: TLSTransport(cli.certPEMBlock, cli.keyPEMBlock, cli.caCert,cli.noTLSVerify),
 			}
 		}
 	}
@@ -627,7 +627,7 @@ func DefaultTransport(tlsNoVerify bool) http.RoundTripper {
 	return transport
 }
 
-func TLSTransport(certPEMBlock, keyPEMBlock, caCert []byte) http.RoundTripper {
+func TLSTransport(certPEMBlock, keyPEMBlock, caCert []byte,TLSNoVerify bool) http.RoundTripper {
 
 	// Load client Certificate
 	cert, err := tls.X509KeyPair(certPEMBlock, keyPEMBlock)
@@ -643,6 +643,7 @@ func TLSTransport(certPEMBlock, keyPEMBlock, caCert []byte) http.RoundTripper {
 	tlsConfig = &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      caCertPool,
+		InsecureSkipVerify: TLSNoVerify,
 	}
 	tlsConfig.BuildNameToCertificate()
 
