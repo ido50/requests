@@ -38,6 +38,7 @@ type HTTPClient struct {
 	baseURL       string                // base URL for all HTTP requests
 	httpCli       *http.Client          // underlying net/http client
 	noTLSVerify   bool                  // are we verifying TLS certificates?
+	renegotiationSupport tls.RenegotiationSupport // support for tls renegotiation
 	authType      authType              // default authentication type for all requests (defaults to no authentication)
 	authUser      string                // default username for all requests
 	authPass      string                // default password for all requests
@@ -171,6 +172,10 @@ func (cli *HTTPClient) NoTLSVerify(enabled bool) *HTTPClient {
 	return cli
 }
 
+func (cli *HTTPClient) SetRenegotiation(support tls.RenegotiationSupport){
+	cli.renegotiationSupport = support
+}
+
 func (cli *HTTPClient) NewRequest(method, path string) *HTTPRequest {
 	return &HTTPRequest{
 		cli:    cli,
@@ -213,11 +218,11 @@ func (cli *HTTPClient) retryRequest(
 	if cli.httpCli == nil {
 		if cli.certPEMBlock == nil {
 			cli.httpCli = &http.Client{
-				Transport: DefaultTransport(cli.noTLSVerify),
+				Transport: DefaultTransport(cli.noTLSVerify,cli.renegotiationSupport),
 			}
 		} else {
 			cli.httpCli = &http.Client{
-				Transport: TLSTransport(cli.certPEMBlock, cli.keyPEMBlock, cli.caCert,cli.noTLSVerify),
+				Transport: TLSTransport(cli.certPEMBlock, cli.keyPEMBlock, cli.caCert,cli.noTLSVerify,cli.renegotiationSupport),
 			}
 		}
 	}
@@ -269,11 +274,11 @@ func (cli *HTTPClient) doRequest(
 	if cli.httpCli == nil {
 		if cli.certPEMBlock == nil {
 			cli.httpCli = &http.Client{
-				Transport: DefaultTransport(cli.noTLSVerify),
+				Transport: DefaultTransport(cli.noTLSVerify,cli.renegotiationSupport),
 			}
 		} else {
 			cli.httpCli = &http.Client{
-				Transport: TLSTransport(cli.certPEMBlock, cli.keyPEMBlock, cli.caCert,cli.noTLSVerify),
+				Transport: TLSTransport(cli.certPEMBlock, cli.keyPEMBlock, cli.caCert,cli.noTLSVerify,cli.renegotiationSupport),
 			}
 		}
 	}
@@ -610,7 +615,7 @@ func defaultBodyHandler(
 	return nil
 }
 
-func DefaultTransport(tlsNoVerify bool) http.RoundTripper {
+func DefaultTransport(tlsNoVerify bool, renegotiationSupport tls.RenegotiationSupport) http.RoundTripper {
 	// this is a modification of Golang's default HTTP transport
 	// (https://golang.org/pkg/net/http/#RoundTripper) with options
 	// to ignore invalid or self-signed TLS certificates and to configure
@@ -621,13 +626,14 @@ func DefaultTransport(tlsNoVerify bool) http.RoundTripper {
 	var tlsConfig *tls.Config
 	tlsConfig = &tls.Config{
 		InsecureSkipVerify: tlsNoVerify,
+		Renegotiation: renegotiationSupport,
 	}
 
 	var transport http.RoundTripper = buildTransport(tlsConfig)
 	return transport
 }
 
-func TLSTransport(certPEMBlock, keyPEMBlock, caCert []byte,TLSNoVerify bool) http.RoundTripper {
+func TLSTransport(certPEMBlock, keyPEMBlock, caCert []byte,TLSNoVerify bool,renegotiationSupport tls.RenegotiationSupport) http.RoundTripper {
 
 	// Load client Certificate
 	cert, err := tls.X509KeyPair(certPEMBlock, keyPEMBlock)
@@ -644,6 +650,7 @@ func TLSTransport(certPEMBlock, keyPEMBlock, caCert []byte,TLSNoVerify bool) htt
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      caCertPool,
 		InsecureSkipVerify: TLSNoVerify,
+		Renegotiation: renegotiationSupport,
 	}
 	tlsConfig.BuildNameToCertificate()
 
