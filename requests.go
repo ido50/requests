@@ -35,24 +35,24 @@ const (
 // website. The client includes default options that are relevant for all
 // requests (but can be overriden per-request).
 type HTTPClient struct {
-	baseURL       string                // base URL for all HTTP requests
-	httpCli       *http.Client          // underlying net/http client
-	noTLSVerify   bool                  // are we verifying TLS certificates?
+	baseURL              string                   // base URL for all HTTP requests
+	httpCli              *http.Client             // underlying net/http client
+	noTLSVerify          bool                     // are we verifying TLS certificates?
 	renegotiationSupport tls.RenegotiationSupport // support for tls renegotiation
-	authType      authType              // default authentication type for all requests (defaults to no authentication)
-	authUser      string                // default username for all requests
-	authPass      string                // default password for all requests
-	authHeader    string                // header name for authentication (defaults to 'Authorization')
-	customHeaders map[string]string     // default headers for all requests
-	accept        string                // default expected response content type for all requests
-	timeout       time.Duration         // default timeout for all requests
-	retryLimit    uint8                 // default retry limit for all requests
-	errorHandler  func(io.Reader) error // default error handler for all requests returning unexpected status
-	bodyHandler   BodyHandlerFunc       // default body handler for requests (when Content-Type is not automatically handled by this library)
-	logger        *zap.Logger           // logger to use (only debug messages are printed by the library; defaults to noop logger)
-	certPEMBlock  []byte
-	keyPEMBlock   []byte
-	caCert        []byte
+	authType             authType                 // default authentication type for all requests (defaults to no authentication)
+	authUser             string                   // default username for all requests
+	authPass             string                   // default password for all requests
+	authHeader           string                   // header name for authentication (defaults to 'Authorization')
+	customHeaders        map[string]string        // default headers for all requests
+	accept               string                   // default expected response content type for all requests
+	timeout              time.Duration            // default timeout for all requests
+	retryLimit           uint8                    // default retry limit for all requests
+	errorHandler         func(io.Reader) error    // default error handler for all requests returning unexpected status
+	bodyHandler          BodyHandlerFunc          // default body handler for requests (when Content-Type is not automatically handled by this library)
+	logger               *zap.Logger              // logger to use (only debug messages are printed by the library; defaults to noop logger)
+	certPEMBlock         []byte
+	keyPEMBlock          []byte
+	caCert               []byte
 }
 
 // HTTPRequest represents a single HTTP request to the web service defined
@@ -172,8 +172,9 @@ func (cli *HTTPClient) NoTLSVerify(enabled bool) *HTTPClient {
 	return cli
 }
 
-func (cli *HTTPClient) SetRenegotiation(support tls.RenegotiationSupport){
+func (cli *HTTPClient) SetRenegotiation(support tls.RenegotiationSupport) *HTTPClient {
 	cli.renegotiationSupport = support
+	return cli
 }
 
 func (cli *HTTPClient) NewRequest(method, path string) *HTTPRequest {
@@ -218,11 +219,11 @@ func (cli *HTTPClient) retryRequest(
 	if cli.httpCli == nil {
 		if cli.certPEMBlock == nil {
 			cli.httpCli = &http.Client{
-				Transport: DefaultTransport(cli.noTLSVerify,cli.renegotiationSupport),
+				Transport: DefaultTransport(cli.noTLSVerify, cli.renegotiationSupport),
 			}
 		} else {
 			cli.httpCli = &http.Client{
-				Transport: TLSTransport(cli.certPEMBlock, cli.keyPEMBlock, cli.caCert,cli.noTLSVerify,cli.renegotiationSupport),
+				Transport: TLSTransport(cli.certPEMBlock, cli.keyPEMBlock, cli.caCert, cli.noTLSVerify, cli.renegotiationSupport),
 			}
 		}
 	}
@@ -274,11 +275,11 @@ func (cli *HTTPClient) doRequest(
 	if cli.httpCli == nil {
 		if cli.certPEMBlock == nil {
 			cli.httpCli = &http.Client{
-				Transport: DefaultTransport(cli.noTLSVerify,cli.renegotiationSupport),
+				Transport: DefaultTransport(cli.noTLSVerify, cli.renegotiationSupport),
 			}
 		} else {
 			cli.httpCli = &http.Client{
-				Transport: TLSTransport(cli.certPEMBlock, cli.keyPEMBlock, cli.caCert,cli.noTLSVerify,cli.renegotiationSupport),
+				Transport: TLSTransport(cli.certPEMBlock, cli.keyPEMBlock, cli.caCert, cli.noTLSVerify, cli.renegotiationSupport),
 			}
 		}
 	}
@@ -566,7 +567,7 @@ func (req *HTTPRequest) RunContext(ctx context.Context) error {
 
 	// what are we loading the response into and how? make sure we're only
 	// doing this if there is a response content
-	if res.StatusCode != http.StatusNoContent && req.into != nil {
+	if res.StatusCode != http.StatusNoContent && req.into != nil && res.ContentLength > 0 {
 		var handler BodyHandlerFunc
 		if req.bodyHandler != nil {
 			handler = req.bodyHandler
@@ -626,14 +627,14 @@ func DefaultTransport(tlsNoVerify bool, renegotiationSupport tls.RenegotiationSu
 	var tlsConfig *tls.Config
 	tlsConfig = &tls.Config{
 		InsecureSkipVerify: tlsNoVerify,
-		Renegotiation: renegotiationSupport,
+		Renegotiation:      renegotiationSupport,
 	}
 
 	var transport http.RoundTripper = buildTransport(tlsConfig)
 	return transport
 }
 
-func TLSTransport(certPEMBlock, keyPEMBlock, caCert []byte,TLSNoVerify bool,renegotiationSupport tls.RenegotiationSupport) http.RoundTripper {
+func TLSTransport(certPEMBlock, keyPEMBlock, caCert []byte, TLSNoVerify bool, renegotiationSupport tls.RenegotiationSupport) http.RoundTripper {
 
 	// Load client Certificate
 	cert, err := tls.X509KeyPair(certPEMBlock, keyPEMBlock)
@@ -647,10 +648,10 @@ func TLSTransport(certPEMBlock, keyPEMBlock, caCert []byte,TLSNoVerify bool,rene
 	var tlsConfig *tls.Config
 	// Setup HTTPS client
 	tlsConfig = &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		RootCAs:      caCertPool,
+		Certificates:       []tls.Certificate{cert},
+		RootCAs:            caCertPool,
 		InsecureSkipVerify: TLSNoVerify,
-		Renegotiation: renegotiationSupport,
+		Renegotiation:      renegotiationSupport,
 	}
 	tlsConfig.BuildNameToCertificate()
 
