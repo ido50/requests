@@ -567,7 +567,7 @@ func (req *HTTPRequest) RunContext(ctx context.Context) error {
 
 	// what are we loading the response into and how? make sure we're only
 	// doing this if there is a response content
-	if res.StatusCode != http.StatusNoContent && req.into != nil && res.ContentLength > 0 {
+	if res.StatusCode != http.StatusNoContent && req.into != nil && (res.Header.Get("Content-Length") == "" ||  res.ContentLength > 0 ) {
 		var handler BodyHandlerFunc
 		if req.bodyHandler != nil {
 			handler = req.bodyHandler
