@@ -47,7 +47,7 @@ type HTTPClient struct {
 	accept               string                   // default expected response content type for all requests
 	timeout              time.Duration            // default timeout for all requests
 	retryLimit           uint8                    // default retry limit for all requests
-	errorHandler         func(io.Reader) error    // default error handler for all requests returning unexpected status
+	errorHandler         ErrorHandlerFunc         // default error handler for all requests returning unexpected status
 	bodyHandler          BodyHandlerFunc          // default body handler for requests (when Content-Type is not automatically handled by this library)
 	logger               *zap.Logger              // logger to use (only debug messages are printed by the library; defaults to noop logger)
 	certPEMBlock         []byte
@@ -58,39 +58,54 @@ type HTTPClient struct {
 // HTTPRequest represents a single HTTP request to the web service defined
 // in the client.
 type HTTPRequest struct {
-	cli            *HTTPClient           // the HTTPClient this request belongs to
-	method         string                // HTTP method/verb to use (GET, POST, PUT, etc.)
-	path           string                // request path (will be appended to the client's base URL)
-	queryParams    url.Values            // URL query parameters for the request
-	cookies        []*http.Cookie        // cookies to send with the HTTP request
-	contentType    string                // content type of the request's body
-	body           []byte                // reader for the request's body
-	into           interface{}           // pointer to a variable where the response will be loaded into
-	headersInto    map[string]*string    // map of header names to pointers where response header values will be loaded into
-	statusInto     *int                  // pointer where response status code will be loaded
-	cookiesInto    *[]*http.Cookie       // pointer where response cookies will be loaded
-	expectedStatus int                   // expected status code from the server (defaults to 200)
-	err            error                 // error encountered during building the request
-	authType       authType              // authentication type for the request (defaults to no authentication)
-	authUser       string                // username for the request
-	authPass       string                // password for the request
-	authHeader     string                // header used for authentication (defaults to 'Authorization')
-	customHeaders  map[string]string     // headers for the request (headers from the client will be used as well, but headers defined here take precedence)
-	accept         string                // expected response content type
-	timeout        time.Duration         // timeout for the request
-	retryLimit     uint8                 // retry limit for the request
-	sizeLimit      int64                 // reject responses whose body size exceeds this value
-	errorHandler   func(io.Reader) error // error handler for request if returned status is not the expected one
-	bodyHandler    BodyHandlerFunc       // body handler for request (when Content-Type is not automatically handled by this library)
-	logger         *zap.Logger           // logger to use (only debug messages are printed by the library; defaults to noop logger)
+	cli              *HTTPClient        // the HTTPClient this request belongs to
+	method           string             // HTTP method/verb to use (GET, POST, PUT, etc.)
+	path             string             // request path (will be appended to the client's base URL)
+	queryParams      url.Values         // URL query parameters for the request
+	cookies          []*http.Cookie     // cookies to send with the HTTP request
+	contentType      string             // content type of the request's body
+	body             []byte             // reader for the request's body
+	into             interface{}        // pointer to a variable where the response will be loaded into
+	headersInto      map[string]*string // map of header names to pointers where response header values will be loaded into
+	statusInto       *int               // pointer where response status code will be loaded
+	cookiesInto      *[]*http.Cookie    // pointer where response cookies will be loaded
+	expectedStatuses []int              // expected status codes from the server (defaults to any 2xx status)
+	err              error              // error encountered during building the request
+	authType         authType           // authentication type for the request (defaults to no authentication)
+	authUser         string             // username for the request
+	authPass         string             // password for the request
+	authHeader       string             // header used for authentication (defaults to 'Authorization')
+	customHeaders    map[string]string  // headers for the request (headers from the client will be used as well, but headers defined here take precedence)
+	accept           string             // expected response content type
+	timeout          time.Duration      // timeout for the request
+	retryLimit       uint8              // retry limit for the request
+	sizeLimit        int64              // reject responses whose body size exceeds this value
+	errorHandler     ErrorHandlerFunc   // error handler for the request if returned status is not the expected one(s)
+	bodyHandler      BodyHandlerFunc    // body handler for the request (when Content-Type is not automatically handled by this library)
+	logger           *zap.Logger        // logger to use (only debug messages are printed by the library; defaults to noop logger)
 }
 
-// BodyHandlerFunc is a function that processes the request body and reads
-// it into the target variable. It receives the content type of the response
-// (from the Content-Type header), the body reader, and the target variable
-// (which is whatever was provided to the Into() method). It is not necessary
-// to close the body or read it to its entirety.
-type BodyHandlerFunc func(contentType string, body io.Reader, target interface{}) error
+// BodyHandlerFunc is a function that processes the response body and reads
+// it into the target variable. It receives the status and content type of the
+// response (the latter taken from the Content-Type header), the body reader,
+// and the target variable (which is whatever was provided to the Into()
+// method). It is not necessary to close the body or read it to its entirety.
+type BodyHandlerFunc func(
+	httpStatus int,
+	contentType string,
+	body io.Reader,
+	target interface{},
+) error
+
+// ErrorHandlerFunc is similar to BodyHandler, but is called when requests generate
+// an unsuccessful response (defined as anything that is not one of the
+// expected statuses). It receives the same parameters except "target", and is
+// expected to return a formatted error to the client
+type ErrorHandlerFunc func(
+	httpStatus int,
+	contentType string,
+	body io.Reader,
+) error
 
 var (
 	ErrSizeExceeded   = errors.New("response size exceeded limit")
@@ -148,7 +163,7 @@ func (cli *HTTPClient) Header(key, value string) *HTTPClient {
 	return cli
 }
 
-func (cli *HTTPClient) ErrorHandler(handler func(io.Reader) error) *HTTPClient {
+func (cli *HTTPClient) ErrorHandler(handler ErrorHandlerFunc) *HTTPClient {
 	cli.errorHandler = handler
 	return cli
 }
@@ -381,7 +396,12 @@ func (req *HTTPRequest) CookiesInto(into *[]*http.Cookie) *HTTPRequest {
 }
 
 func (req *HTTPRequest) ExpectedStatus(status int) *HTTPRequest {
-	req.expectedStatus = status
+	req.expectedStatuses = []int{status}
+	return req
+}
+
+func (req *HTTPRequest) ExpectedStatuses(statuses ...int) *HTTPRequest {
+	req.expectedStatuses = statuses
 	return req
 }
 
@@ -401,7 +421,7 @@ func (req *HTTPRequest) Header(key, value string) *HTTPRequest {
 	return req
 }
 
-func (req *HTTPRequest) ErrorHandler(handler func(io.Reader) error) *HTTPRequest {
+func (req *HTTPRequest) ErrorHandler(handler ErrorHandlerFunc) *HTTPRequest {
 	req.errorHandler = handler
 	return req
 }
@@ -419,11 +439,6 @@ func (req *HTTPRequest) RunContext(ctx context.Context) error {
 	// did we fail during building the request? if so, return the error
 	if req.err != nil {
 		return req.err
-	}
-
-	// if no expected status is set, expect 200 OK
-	if req.expectedStatus == 0 {
-		req.expectedStatus = http.StatusOK
 	}
 
 	// build the request URL from the client's base URL and the request's
@@ -554,20 +569,32 @@ func (req *HTTPRequest) RunContext(ctx context.Context) error {
 	// did the response return with the expected status code? if not,
 	// and there's an error handler, call it with the body, otherwise
 	// return a generic error
-	if res.StatusCode != req.expectedStatus {
-		handler := req.errorHandler
-		if handler == nil {
+	var successful bool
+	if len(req.expectedStatuses) > 0 {
+		successful = contains(req.expectedStatuses, res.StatusCode)
+	} else {
+		successful = res.StatusCode >= 200 && res.StatusCode < 300
+	}
+
+	if !successful {
+		var handler ErrorHandlerFunc
+		if req.errorHandler != nil {
+			handler = req.errorHandler
+		} else if req.cli.errorHandler != nil {
 			handler = req.cli.errorHandler
+		} else {
+			handler = defaultErrorHandler
 		}
-		if handler != nil {
-			return handler(res.Body)
-		}
-		return errors.Errorf("server returned unexpected status %d", res.StatusCode)
+		return handler(
+			res.StatusCode,
+			res.Header.Get("Content-Type"),
+			res.Body,
+		)
 	}
 
 	// what are we loading the response into and how? make sure we're only
 	// doing this if there is a response content
-	if res.StatusCode != http.StatusNoContent && req.into != nil && (res.Header.Get("Content-Length") == "" ||  res.ContentLength > 0 ) {
+	if res.StatusCode != http.StatusNoContent && req.into != nil && (res.Header.Get("Content-Length") == "" || res.ContentLength > 0) {
 		var handler BodyHandlerFunc
 		if req.bodyHandler != nil {
 			handler = req.bodyHandler
@@ -576,12 +603,18 @@ func (req *HTTPRequest) RunContext(ctx context.Context) error {
 		} else {
 			handler = defaultBodyHandler
 		}
-		err = handler(res.Header.Get("Content-Type"), res.Body, req.into)
+		err = handler(
+			res.StatusCode,
+			res.Header.Get("Content-Type"),
+			res.Body,
+			req.into,
+		)
 	}
 	return err
 }
 
 func defaultBodyHandler(
+	_ int,
 	contentType string,
 	body io.Reader,
 	target interface{},
@@ -614,6 +647,14 @@ func defaultBodyHandler(
 	}
 
 	return nil
+}
+
+func defaultErrorHandler(
+	status int,
+	_ string,
+	_ io.Reader,
+) (err error) {
+	return errors.Errorf("server returned unexpected status %d", status)
 }
 
 func DefaultTransport(tlsNoVerify bool, renegotiationSupport tls.RenegotiationSupport) http.RoundTripper {
@@ -660,7 +701,6 @@ func TLSTransport(certPEMBlock, keyPEMBlock, caCert []byte, TLSNoVerify bool, re
 }
 
 func buildTransport(tlsconfig *tls.Config) http.RoundTripper {
-
 	var transport http.RoundTripper = &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -675,4 +715,13 @@ func buildTransport(tlsconfig *tls.Config) http.RoundTripper {
 		TLSClientConfig:       tlsconfig,
 	}
 	return transport
+}
+
+func contains(slice []int, wanted int) bool {
+	for _, s := range slice {
+		if s == wanted {
+			return true
+		}
+	}
+	return false
 }

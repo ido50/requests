@@ -191,7 +191,7 @@ func TestCustomBodyHandler(t *testing.T) {
 
 	err := NewClient(ts.URL).
 		NewRequest("GET", "/").
-		BodyHandler(func(cType string, reader io.Reader, target interface{}) error {
+		BodyHandler(func(status int, cType string, reader io.Reader, target interface{}) error {
 			if cType != "application/x.rot13" {
 				return errors.Errorf("unexpected content type %s returned", cType)
 			}
@@ -212,14 +212,14 @@ func TestCustomBodyHandler(t *testing.T) {
 	}
 }
 
-func TestTLSConnection (t *testing.T) {
+func TestTLSConnection(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		fmt.Fprintln(w, "Lorem ipsum dolor sit amet")
 	}))
 	defer ts.Close()
 
-	certpem :=`-----BEGIN CERTIFICATE-----
+	certpem := `-----BEGIN CERTIFICATE-----
 MIIC+TCCAeGgAwIBAgIRAJTH5D+Q6YNUn+jnF1TDxikwDQYJKoZIhvcNAQELBQAw
 EjEQMA4GA1UEChMHQWNtZSBDbzAeFw0xODA3MTExNDM1MjBaFw0xOTA3MTExNDM1
 MjBaMBIxEDAOBgNVBAoTB0FjbWUgQ28wggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAw
@@ -266,9 +266,8 @@ aUz5HXBcNYdNTwmMhJeR+2PjQLwK8XKQyR/OXPwgpDhYdpI8jx4AV4VakekES2Mx
 0soArFGOSvrfeB0pT7L6hzoCS806+qZPiHpag+h2iFnooNQWvC8=
 -----END RSA PRIVATE KEY-----`
 
-
 	cli := NewClient(ts.URL).Accept("text/plain").SetTLS([]byte(certpem),
-		[]byte(keypem),[]byte(certpem))
+		[]byte(keypem), []byte(certpem))
 
 	var text string
 	var status int
