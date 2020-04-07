@@ -19,6 +19,7 @@ import (
 	"unicode"
 
 	"github.com/pkg/errors"
+
 	"go.uber.org/zap"
 
 	"log"
@@ -443,7 +444,7 @@ func (req *HTTPRequest) RunContext(ctx context.Context) error {
 
 	// build the request URL from the client's base URL and the request's
 	// path, plus add any query parameters defined
-	if !strings.HasPrefix(req.path, "/") {
+	if req.path != "" && !strings.HasPrefix(req.path, "/") {
 		req.path = fmt.Sprintf("/%s", req.path)
 	}
 	reqURL := req.cli.baseURL + req.path
