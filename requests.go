@@ -1,3 +1,75 @@
+// Package requests is a high-level, API-centric HTTP client for Go projects. It
+// is meant to provide a more comfortable mechanism to perform requests to HTTP
+// APIs (rather than making general requests), and to prevent common mistakes
+// made when using net/http directly.
+//
+// With requests, one must not need to remember to read HTTP responses in full
+// (so Go can reuse TCP connections), nor to close response bodies. Handling of
+// JSON data - be it in requests or responses - is made easier by way of built-in
+// encoders/decoders. An automatic retry mechanism is also included.
+//
+// The library allows a "DRY" (Dont Repeat Yourself) approach to REST API usage
+// by introducing API-specific dependencies into the client object. For example,
+// authorization headers and response handlers can be set in the client object,
+// and all generated requests will automatically include them.
+//
+//
+//
+// Usage
+//
+//
+//
+//		package main
+//
+//		import (
+//			"fmt"
+//			"net/http"
+//			"time"
+//
+//			"github.com/ido50/requests"
+//		)
+//
+//		const apiURL = "https://my.api.com/v2"
+//
+//		type RequestBody struct {
+//			Title   string   `json:"title"`
+//			Tags    []string `json:"tags"`
+//			Publish bool     `json:"publish"`
+//		}
+//
+//		type ResponseBody struct {
+//			ID   int64     `json:"id"`
+//			Date time.Time `json:"date"`
+//		}
+//
+//		func main() {
+//			client := requests.
+//				NewClient(apiURL).
+//				Accept("application/json").
+//				BasicAuth("user", "pass").
+//				RetryLimit(3)
+//
+//			var res ResponseBody
+//
+//			err := client.
+//				NewRequest("POST", "/articles").
+//				JSONBody(RequestBody{
+//					Title:   "Test Title",
+//					Tags:    []string{"test", "stories"},
+//					Publish: true,
+//				}).
+//				ExpectedStatus(http.StatusCreated).
+//				Into(&res).
+//				Run()
+//			if err != nil {
+//				panic(err)
+//			}
+//
+//			fmt.Printf(
+//				"Created article %d on %s\n",
+//				res.ID, res.Date.Format(time.RFC3339),
+//			)
+//		}
 package requests
 
 import (
@@ -7,9 +79,11 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,11 +92,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/pkg/errors"
-
 	"go.uber.org/zap"
-
-	"log"
 )
 
 type authType string
@@ -32,58 +102,136 @@ const (
 	basicAuth authType = "basic"
 )
 
+const defaultAuthHeader = "Authorization"
+
 // HTTPClient represents a client for making requests to a web service or
 // website. The client includes default options that are relevant for all
-// requests (but can be overriden per-request).
+// requests (but can be overridden per-request).
 type HTTPClient struct {
-	baseURL              string                   // base URL for all HTTP requests
-	httpCli              *http.Client             // underlying net/http client
-	noTLSVerify          bool                     // are we verifying TLS certificates?
-	renegotiationSupport tls.RenegotiationSupport // support for tls renegotiation
-	authType             authType                 // default authentication type for all requests (defaults to no authentication)
-	authUser             string                   // default username for all requests
-	authPass             string                   // default password for all requests
-	authHeader           string                   // header name for authentication (defaults to 'Authorization')
-	customHeaders        map[string]string        // default headers for all requests
-	accept               string                   // default expected response content type for all requests
-	timeout              time.Duration            // default timeout for all requests
-	retryLimit           uint8                    // default retry limit for all requests
-	errorHandler         ErrorHandlerFunc         // default error handler for all requests returning unexpected status
-	bodyHandler          BodyHandlerFunc          // default body handler for requests (when Content-Type is not automatically handled by this library)
-	logger               *zap.Logger              // logger to use (only debug messages are printed by the library; defaults to noop logger)
+	// base URL for all HTTP requests
+	baseURL string
+
+	// default authentication type for all requests (defaults to no authentication)
+	authType authType
+
+	// default username for all requests
+	authUser string
+
+	// default password for all requests
+	authPass string
+
+	// header name for authentication (defaults to 'Authorization')
+	authHeader string
+
+	// default expected response content type for all requests
+	accept string
+
+	// default timeout for all requests
+	timeout time.Duration
+
+	// default error handler for all requests returning unexpected status
+	errorHandler ErrorHandlerFunc
+
+	// default body handler for requests (when Content-Type is not automatically handled by this library)
+	bodyHandler BodyHandlerFunc
+
+	// default headers for all requests
+	customHeaders map[string]string
+
+	// custom TLS attributes
 	certPEMBlock         []byte
 	keyPEMBlock          []byte
 	caCert               []byte
+	renegotiationSupport tls.RenegotiationSupport
+	noTLSVerify          bool
+
+	// default retry limit for all requests
+	retryLimit uint8
+
+	// logger to use (only debug messages are printed by the library; defaults to noop logger)
+	logger *zap.Logger
+
+	// underlying net/http client
+	httpCli *http.Client
 }
 
 // HTTPRequest represents a single HTTP request to the web service defined
 // in the client.
 type HTTPRequest struct {
-	cli              *HTTPClient        // the HTTPClient this request belongs to
-	method           string             // HTTP method/verb to use (GET, POST, PUT, etc.)
-	path             string             // request path (will be appended to the client's base URL)
-	queryParams      url.Values         // URL query parameters for the request
-	cookies          []*http.Cookie     // cookies to send with the HTTP request
-	contentType      string             // content type of the request's body
-	body             []byte             // reader for the request's body
-	into             interface{}        // pointer to a variable where the response will be loaded into
-	headersInto      map[string]*string // map of header names to pointers where response header values will be loaded into
-	statusInto       *int               // pointer where response status code will be loaded
-	cookiesInto      *[]*http.Cookie    // pointer where response cookies will be loaded
-	expectedStatuses []int              // expected status codes from the server (defaults to any 2xx status)
-	err              error              // error encountered during building the request
-	authType         authType           // authentication type for the request (defaults to no authentication)
-	authUser         string             // username for the request
-	authPass         string             // password for the request
-	authHeader       string             // header used for authentication (defaults to 'Authorization')
-	customHeaders    map[string]string  // headers for the request (headers from the client will be used as well, but headers defined here take precedence)
-	accept           string             // expected response content type
-	timeout          time.Duration      // timeout for the request
-	retryLimit       uint8              // retry limit for the request
-	sizeLimit        int64              // reject responses whose body size exceeds this value
-	errorHandler     ErrorHandlerFunc   // error handler for the request if returned status is not the expected one(s)
-	bodyHandler      BodyHandlerFunc    // body handler for the request (when Content-Type is not automatically handled by this library)
-	logger           *zap.Logger        // logger to use (only debug messages are printed by the library; defaults to noop logger)
+	// the HTTPClient this request belongs to
+	cli *HTTPClient
+
+	// HTTP method/verb to use (GET, POST, PUT, etc.)
+	method string
+
+	// request path (will be appended to the client's base URL)
+	path string
+
+	// URL query parameters for the request
+	queryParams url.Values
+
+	// cookies to send with the HTTP request
+	cookies []*http.Cookie
+
+	// content type of the request's body
+	contentType string
+
+	// reader for the request's body
+	body []byte
+
+	// pointer to a variable where the response will be loaded into
+	into interface{}
+
+	// map of header names to pointers where response header values will be loaded into
+	headersInto map[string]*string
+
+	// pointer where response status code will be loaded
+	statusInto *int
+
+	// pointer where response cookies will be loaded
+	cookiesInto *[]*http.Cookie
+
+	// expected status codes from the server (defaults to any 2xx status)
+	expectedStatuses []int
+
+	// error encountered during building the request
+	err error
+
+	// authentication type for the request (defaults to no authentication)
+	authType authType
+
+	// username for the request
+	authUser string
+
+	// password for the request
+	authPass string
+
+	// header used for authentication (defaults to 'Authorization')
+	authHeader string
+
+	// headers for the request (headers from the client will be used as well, but headers defined here take precedence)
+	customHeaders map[string]string
+
+	// expected response content type
+	accept string
+
+	// timeout for the request
+	timeout time.Duration
+
+	// retry limit for the request
+	retryLimit uint8
+
+	// reject responses whose body size exceeds this value
+	sizeLimit int64
+
+	// error handler for the request if returned status is not the expected one(s)
+	errorHandler ErrorHandlerFunc
+
+	// body handler for the request (when Content-Type is not automatically handled by this library)
+	bodyHandler BodyHandlerFunc
+
+	// logger to use (only debug messages are printed by the library; defaults to noop logger)
+	logger *zap.Logger
 }
 
 // BodyHandlerFunc is a function that processes the response body and reads
@@ -109,33 +257,61 @@ type ErrorHandlerFunc func(
 ) error
 
 var (
-	ErrSizeExceeded   = errors.New("response size exceeded limit")
+	// ErrSizeExceeded is the error returned when the size of an HTTP response
+	// is larger than the set limit
+	ErrSizeExceeded = errors.New("response size exceeded limit")
+
+	// ErrTimeoutReached is the error returned when a request times out
 	ErrTimeoutReached = errors.New("timeout reached")
+
+	// ErrNotAPointer is an error returned when the target variable provided for
+	// a request's Run method is not a pointer.
+	ErrNotAPointer = errors.New("target variable is not a string pointer")
 )
 
+// DefaultTimeout is the default timeout for requests made by the library. This
+// can be overridden on a per-client and per-request basis.
+var DefaultTimeout = 2 * time.Minute
+
+// BaseDelay is the base delay for retrying requests. The library uses a
+// backoff strategy, multiplying the delay between each attempt.
+var BaseDelay = 2 * time.Second
+
+// NewClient creates a new HTTP client for the API whose base URL is provided.
 func NewClient(baseURL string) *HTTPClient {
 	return &HTTPClient{
 		baseURL:  strings.TrimSuffix(baseURL, "/"),
 		authType: noAuth,
-		timeout:  time.Minute * 2,
+		timeout:  DefaultTimeout,
 	}
 }
 
+// Accept sets the response MIME type accepted by the client. Defaults to
+// "application/json".
 func (cli *HTTPClient) Accept(accept string) *HTTPClient {
 	cli.accept = accept
 	return cli
 }
 
+// Timeout sets the total timeout for requests made by the client. The default
+// timeout is 2 minutes.
 func (cli *HTTPClient) Timeout(dur time.Duration) *HTTPClient {
 	cli.timeout = dur
 	return cli
 }
 
+// RetryLimit sets the maximum amount of times requests that failed due to
+// connection issues should be retried. Defaults to 0. Requests are retried with
+// a backoff strategy, with the first retry attempt occurring two seconds after
+// the original request, and the delay before each subsequent attempt is
+// multiplied by two.
 func (cli *HTTPClient) RetryLimit(limit uint8) *HTTPClient {
 	cli.retryLimit = limit
 	return cli
 }
 
+// Logger sets the logger used by the library. Currently, requests uses
+// go.uber.org/zap for logging purposes. All log messages are in the DEBUG level.
 func (cli *HTTPClient) Logger(logger *zap.Logger) *HTTPClient {
 	cli.logger = logger
 	return cli
@@ -145,35 +321,65 @@ func (cli *HTTPClient) getLogger() *zap.Logger {
 	if cli.logger == nil {
 		cli.logger = zap.NewNop()
 	}
+
 	return cli.logger
 }
 
-func (cli *HTTPClient) BasicAuth(user, pass, header string) *HTTPClient {
+// BasicAuth sets basic authentication headers for all HTTP requests made by the
+// client (requests can override this on an individual basis). If a header name
+// is provided as the third argument, the authentication data will be set into
+// that header instead of the standard "Authorization" header. This is mostly
+// useful for Proxy-Authorization or custom headers.
+func (cli *HTTPClient) BasicAuth(
+	user string,
+	pass string,
+	headerName ...string,
+) *HTTPClient {
 	cli.authType = "basic"
 	cli.authUser = user
 	cli.authPass = pass
-	cli.authHeader = header
+
+	if len(headerName) > 0 {
+		cli.authHeader = headerName[0]
+	} else {
+		cli.authHeader = defaultAuthHeader
+	}
+
 	return cli
 }
 
+// Header sets a common header value for all requests made by the client.
 func (cli *HTTPClient) Header(key, value string) *HTTPClient {
 	if cli.customHeaders == nil {
 		cli.customHeaders = make(map[string]string)
 	}
+
 	cli.customHeaders[key] = value
+
 	return cli
 }
 
+// ErrorHandler sets a custom handler function for all requests made by the
+// client. Whenever a request is answered with an error response (or optionally
+// in an unexpected status), the handler is called. This allows parsing API
+// error structures so more information can be returned in case of failure.
 func (cli *HTTPClient) ErrorHandler(handler ErrorHandlerFunc) *HTTPClient {
 	cli.errorHandler = handler
 	return cli
 }
 
+// BodyHandler sets a customer handler function for all requests made by the
+// client. If provided, the handler will be called with the response status,
+// content type, and body reader. This allows customizing the way response
+// bodies are parsed, for example if the API does not use JSON serialization.
+// Usually, the library's internal handler is sufficient for API usage.
 func (cli *HTTPClient) BodyHandler(handler BodyHandlerFunc) *HTTPClient {
 	cli.bodyHandler = handler
 	return cli
 }
 
+// NoTLSVerify allows ignoring invalid or self-signed TLS certificates presented
+// by HTTPS servers.
 func (cli *HTTPClient) NoTLSVerify(enabled bool) *HTTPClient {
 	if cli.httpCli != nil {
 		transport, ok := cli.httpCli.Transport.(*http.Transport)
@@ -184,28 +390,24 @@ func (cli *HTTPClient) NoTLSVerify(enabled bool) *HTTPClient {
 			cli.httpCli = nil
 		}
 	}
+
 	cli.noTLSVerify = enabled
+
 	return cli
 }
 
+// SetRenegotiation allows setting the TLS renegotiation level. See crypto/tls
+// for more information.
 func (cli *HTTPClient) SetRenegotiation(support tls.RenegotiationSupport) *HTTPClient {
 	cli.renegotiationSupport = support
 	return cli
 }
 
-func (cli *HTTPClient) NewRequest(method, path string) *HTTPRequest {
-	return &HTTPRequest{
-		cli:    cli,
-		path:   path,
-		method: method,
-		logger: cli.getLogger().With(
-			zap.String("path", path),
-			zap.String("method", method),
-		),
-	}
-}
-
-func (cli *HTTPClient) SetTLS(certPEMBlock, keyPEMBlock, caCert []byte) *HTTPClient {
+// SetTLS, together with NoTLSVerify and SetRenegotiation, allows creating a
+// custom TLS transport.
+func (cli *HTTPClient) SetTLS(
+	certPEMBlock, keyPEMBlock, caCert []byte,
+) *HTTPClient {
 	cli.caCert = caCert
 	cli.keyPEMBlock = keyPEMBlock
 	cli.certPEMBlock = certPEMBlock
@@ -213,6 +415,9 @@ func (cli *HTTPClient) SetTLS(certPEMBlock, keyPEMBlock, caCert []byte) *HTTPCli
 	return cli
 }
 
+// Do performs an HTTP request represented as a net/http.Request object. This
+// method was added so that an HTTPClient object will implement a common interface
+// for HTTP clients. Generally, there is no need to use this method.
 func (cli *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 	return cli.retryRequest(
 		context.Background(),
@@ -235,11 +440,17 @@ func (cli *HTTPClient) retryRequest(
 	if cli.httpCli == nil {
 		if cli.certPEMBlock == nil {
 			cli.httpCli = &http.Client{
-				Transport: DefaultTransport(cli.noTLSVerify, cli.renegotiationSupport),
+				Transport: defaultTransport(cli.noTLSVerify, cli.renegotiationSupport),
 			}
 		} else {
 			cli.httpCli = &http.Client{
-				Transport: TLSTransport(cli.certPEMBlock, cli.keyPEMBlock, cli.caCert, cli.noTLSVerify, cli.renegotiationSupport),
+				Transport: tlsTransport(
+					cli.certPEMBlock,
+					cli.keyPEMBlock,
+					cli.caCert,
+					cli.noTLSVerify,
+					cli.renegotiationSupport,
+				),
 			}
 		}
 	}
@@ -248,7 +459,7 @@ func (cli *HTTPClient) retryRequest(
 		logger = zap.NewNop()
 	}
 
-	delay := 2 * time.Second
+	delay := BaseDelay
 
 	for attempt := uint8(1); attempt <= attempts; attempt++ {
 		if body != nil {
@@ -288,30 +499,20 @@ func (cli *HTTPClient) doRequest(
 	req *http.Request,
 	timeout time.Duration,
 ) (res *http.Response, err error) {
-	if cli.httpCli == nil {
-		if cli.certPEMBlock == nil {
-			cli.httpCli = &http.Client{
-				Transport: DefaultTransport(cli.noTLSVerify, cli.renegotiationSupport),
-			}
-		} else {
-			cli.httpCli = &http.Client{
-				Transport: TLSTransport(cli.certPEMBlock, cli.keyPEMBlock, cli.caCert, cli.noTLSVerify, cli.renegotiationSupport),
-			}
-		}
-	}
-
 	// initiate the request
 	req = req.WithContext(parentCtx)
 
 	if timeout > 0 {
-		ctx, _ := context.WithTimeout(parentCtx, timeout)
+		ctx, cancel := context.WithTimeout(parentCtx, timeout)
+		defer cancel()
+
 		req = req.WithContext(ctx)
 	}
 
 	res, err = cli.httpCli.Do(req)
 	if err != nil {
 		if urlErr, ok := err.(*url.Error); ok {
-			if urlErr.Err == context.DeadlineExceeded {
+			if errors.Is(urlErr.Err, context.DeadlineExceeded) {
 				err = ErrTimeoutReached
 			}
 		}
@@ -324,197 +525,211 @@ func (cli *HTTPClient) doRequest(
 /*                                REQUESTS                                    */
 /******************************************************************************/
 
+// NewRequest creates a new request object. Requests are progressively
+// composed using a builder/method-chain pattern. The HTTP method and path
+// within the API must be provided. Remember that the client already includes
+// a base URL, so the request URL will be a concatenation of the base URL and
+// the provided path. `path` can be empty.
+func (cli *HTTPClient) NewRequest(method, path string) *HTTPRequest {
+	return &HTTPRequest{
+		cli:    cli,
+		path:   path,
+		method: method,
+		logger: cli.getLogger().With(
+			zap.String("path", path),
+			zap.String("method", method),
+		),
+	}
+}
+
+// QueryParam adds a query parameter and value to the request.
 func (req *HTTPRequest) QueryParam(key, value string) *HTTPRequest {
 	if req.queryParams == nil {
 		req.queryParams = url.Values{}
 	}
+
 	req.queryParams.Add(key, value)
+
 	return req
 }
 
+// Cookie sets a cookie for the request.
 func (req *HTTPRequest) Cookie(cookie *http.Cookie) *HTTPRequest {
 	req.cookies = append(req.cookies, cookie)
 	return req
 }
 
+// Body sets a custom body for the request. The content type of the data must
+// be provided.
 func (req *HTTPRequest) Body(body []byte, contentType string) *HTTPRequest {
 	req.body = body
 	req.contentType = contentType
+
 	return req
 }
 
+// JSONBody encodes the provided Go value into JSON and sets it as the request
+// body.
 func (req *HTTPRequest) JSONBody(body interface{}) *HTTPRequest {
 	var err error
+
 	req.body, err = json.Marshal(body)
 	if err != nil {
-		req.err = errors.Wrap(err, "failed processing JSON body")
+		req.err = fmt.Errorf("failed processing JSON body: %w", err)
 	}
+
 	req.contentType = "application/json; charset=UTF-8"
+
 	return req
 }
 
+// Accept sets the accepted MIME type for the request. This takes precedence
+// over the MIME type provided to the client object itself.
 func (req *HTTPRequest) Accept(accept string) *HTTPRequest {
 	req.accept = accept
 	return req
 }
 
+// Timeout sets the timeout for the request. This takes precedence over the
+// timeout provided to the client object itself.
 func (req *HTTPRequest) Timeout(dur time.Duration) *HTTPRequest {
 	req.timeout = dur
 	return req
 }
 
+// RetryLimit sets the maximum amount of retries for the request. This takes
+// precedence over the limit provided to the client object itself.
 func (req *HTTPRequest) RetryLimit(limit uint8) *HTTPRequest {
 	req.retryLimit = limit
 	return req
 }
 
+// SizeLimit allows limiting the size of response bodies accepted by the client.
+// If the response size is larger than the limit, `ErrSizeExceeded` will be
+// returned.
 func (req *HTTPRequest) SizeLimit(limit int64) *HTTPRequest {
 	req.sizeLimit = limit
 	return req
 }
 
+// Into sets the target variable to which the response body should be parsed.
+// If the API returns JSON, then this should be a pointer to a struct that
+// represents the expected format. If using a custom body handler, this variable
+// will be provided to the handler.
 func (req *HTTPRequest) Into(into interface{}) *HTTPRequest {
 	req.into = into
 	return req
 }
 
+// HeaderInto allows storing the value of a header from the response into a
+// string variable. Since the requests library is made to quickly perform
+// requests to REST APIs, and only a small number of response headers is usually
+// read by application code (if at all), there is no response object that allows
+// viewing headers. Therefore, any code that is interested in reading a response
+// header must declare that in advance and provide a target variable.
 func (req *HTTPRequest) HeaderInto(header string, into *string) *HTTPRequest {
 	if req.headersInto == nil {
 		req.headersInto = make(map[string]*string)
 	}
+
 	req.headersInto[header] = into
+
 	return req
 }
 
+// StatusInto allows storing the status of the response into a variable. The
+// same comments as for HeaderInto apply here as well.
 func (req *HTTPRequest) StatusInto(into *int) *HTTPRequest {
 	req.statusInto = into
 	return req
 }
 
+// Cookies into allows storing cookies in the response into a slice of cookies.
+// The same comments as for HeaderInto apply here as well.
 func (req *HTTPRequest) CookiesInto(into *[]*http.Cookie) *HTTPRequest {
 	req.cookiesInto = into
 	return req
 }
 
+// ExpectedStatus sets the HTTP status that the application expects to receive
+// for the request. If the status received is different than the expected status,
+// the library will return an error, and the error handler will be executed.
 func (req *HTTPRequest) ExpectedStatus(status int) *HTTPRequest {
 	req.expectedStatuses = []int{status}
 	return req
 }
 
+// ExpectedStatuses is the same as ExpectedStatus, but allows setting multiple
+// expected statuses.
 func (req *HTTPRequest) ExpectedStatuses(statuses ...int) *HTTPRequest {
 	req.expectedStatuses = statuses
 	return req
 }
 
-func (req *HTTPRequest) BasicAuth(user, pass, header string) *HTTPRequest {
+// BasicAuth allows setting basic authentication header for the request.
+// Usually, this will be done on the client object rather than the request
+// object, but this method allows overriding authentication for specific
+// requests.
+func (req *HTTPRequest) BasicAuth(
+	user, pass string,
+	headerName ...string,
+) *HTTPRequest {
 	req.authType = "basic"
 	req.authUser = user
 	req.authPass = pass
-	req.authHeader = header
+
+	if len(headerName) > 0 {
+		req.authHeader = headerName[0]
+	} else {
+		req.authHeader = defaultAuthHeader
+	}
+
 	return req
 }
 
+// Header sets the value of a header for the request.
 func (req *HTTPRequest) Header(key, value string) *HTTPRequest {
 	if req.customHeaders == nil {
 		req.customHeaders = make(map[string]string)
 	}
+
 	req.customHeaders[key] = value
+
 	return req
 }
 
+// ErrorHandler sets a custom error handler for the request.
 func (req *HTTPRequest) ErrorHandler(handler ErrorHandlerFunc) *HTTPRequest {
 	req.errorHandler = handler
 	return req
 }
 
+// BodyHandler sets a custom body handler for the request.
 func (req *HTTPRequest) BodyHandler(handler BodyHandlerFunc) *HTTPRequest {
 	req.bodyHandler = handler
 	return req
 }
 
+// Run finalizes the request and executes it. The returned error will be `nil`
+// only if the request was successfully created, sent and a successful (or
+// expected) status code was returned from the server.
 func (req *HTTPRequest) Run() error {
 	return req.RunContext(context.Background())
 }
 
+// RunContext is the same as Run, but executes the request with the provided
+// context value.
 func (req *HTTPRequest) RunContext(ctx context.Context) error {
 	// did we fail during building the request? if so, return the error
 	if req.err != nil {
 		return req.err
 	}
 
-	// build the request URL from the client's base URL and the request's
-	// path, plus add any query parameters defined
-	if req.path != "" && !strings.HasPrefix(req.path, "/") {
-		req.path = fmt.Sprintf("/%s", req.path)
-	}
-	reqURL := req.cli.baseURL + req.path
-	if req.queryParams != nil {
-		if queryParams := req.queryParams.Encode(); queryParams != "" {
-			reqURL += "?" + queryParams
-		}
-	}
-
-	// create the net/http.Request object
-	r, err := http.NewRequest(req.method, reqURL, nil)
+	// create the request
+	r, err := req.createRequest()
 	if err != nil {
-		return errors.Wrap(err, "failed creating request")
+		return err
 	}
-
-	// add cookies
-	for _, c := range req.cookies {
-		r.AddCookie(c)
-	}
-
-	// are we using basic authentication?
-	if req.authType == basicAuth || req.cli.authType == basicAuth {
-		// take user, password and authentication header from the
-		// request if provided, otherwise from the client
-		user := req.authUser
-		pass := req.authPass
-		header := req.authHeader
-		if user == "" {
-			user = req.cli.authUser
-		}
-		if pass == "" {
-			pass = req.cli.authPass
-		}
-		if header == "" {
-			header = req.cli.authHeader
-		}
-		if header == "" {
-			header = "Authorization"
-		}
-
-		r.Header.Add(header, "Basic "+base64.StdEncoding.EncodeToString([]byte(user+":"+pass)))
-	}
-
-	// what is the content type of our body?
-	if req.contentType != "" {
-		r.Header.Add("Content-Type", req.contentType)
-	}
-
-	// add custom headers from the client, then from the request (headers from
-	// the request itself override those from the client)
-	if req.cli.customHeaders != nil {
-		for key, value := range req.cli.customHeaders {
-			r.Header.Add(key, value)
-		}
-	}
-	if req.customHeaders != nil {
-		for key, value := range req.customHeaders {
-			r.Header.Add(key, value)
-		}
-	}
-
-	// what content type are we expecting to get back? if nothing is defined,
-	// use application/json. Add this content type in an Accept header.
-	if req.accept == "" {
-		req.accept = req.cli.accept
-		if req.accept == "" {
-			req.accept = "application/json"
-		}
-	}
-	r.Header.Add("Accept", req.accept)
 
 	// how many attempts are we gonna make?
 	var attempts = uint8(1)
@@ -533,24 +748,95 @@ func (req *HTTPRequest) RunContext(ctx context.Context) error {
 	// run the request
 	res, err := req.cli.retryRequest(ctx, req.logger, r, req.body, timeout, attempts)
 	if err != nil {
-		if err == ErrTimeoutReached {
+		if errors.Is(err, ErrTimeoutReached) {
 			return err
 		}
-		return errors.Wrap(err, "request failed")
+
+		return fmt.Errorf("request failed: %w", err)
 	}
 
 	// make sure to read the entire body and close the request once we're
 	// done, this is important in order to reuse connections and prevent
 	// connection leaks
 	defer func() {
+		// nolint: errcheck
 		io.Copy(ioutil.Discard, res.Body)
 		res.Body.Close()
 	}()
 
+	// make sure response size does not exceed the limit
 	if req.sizeLimit > 0 && res.ContentLength > req.sizeLimit {
 		return ErrSizeExceeded
 	}
 
+	return req.parseResponse(res)
+}
+
+func (req *HTTPRequest) createRequest() (r *http.Request, err error) {
+	// build the request URL from the client's base URL and the request's
+	// path, plus add any query parameters defined
+	if req.path != "" && !strings.HasPrefix(req.path, "/") {
+		req.path = fmt.Sprintf("/%s", req.path)
+	}
+
+	reqURL := req.cli.baseURL + req.path
+
+	if req.queryParams != nil {
+		if queryParams := req.queryParams.Encode(); queryParams != "" {
+			reqURL += "?" + queryParams
+		}
+	}
+
+	// create the net/http.Request object
+	r, err = http.NewRequest(req.method, reqURL, nil)
+	if err != nil {
+		return r, fmt.Errorf("failed creating request: %w", err)
+	}
+
+	// add cookies
+	for _, c := range req.cookies {
+		r.AddCookie(c)
+	}
+
+	// are we using basic authentication?
+	if req.authType == basicAuth || req.cli.authType == basicAuth {
+		setBasicAuth(req, r)
+	}
+
+	// what is the content type of our body?
+	if req.contentType != "" {
+		r.Header.Add("Content-Type", req.contentType)
+	}
+
+	// add custom headers from the client, then from the request (headers from
+	// the request itself override those from the client)
+	if req.cli.customHeaders != nil {
+		for key, value := range req.cli.customHeaders {
+			r.Header.Add(key, value)
+		}
+	}
+
+	if req.customHeaders != nil {
+		for key, value := range req.customHeaders {
+			r.Header.Add(key, value)
+		}
+	}
+
+	// what content type are we expecting to get back? if nothing is defined,
+	// use application/json. Add this content type in an Accept header.
+	if req.accept == "" {
+		req.accept = req.cli.accept
+		if req.accept == "" {
+			req.accept = "application/json"
+		}
+	}
+
+	r.Header.Add("Accept", req.accept)
+
+	return r, nil
+}
+
+func (req *HTTPRequest) parseResponse(res *http.Response) error {
 	// are there any headers from the response we need to read?
 	if req.headersInto != nil {
 		for key, into := range req.headersInto {
@@ -574,18 +860,22 @@ func (req *HTTPRequest) RunContext(ctx context.Context) error {
 	if len(req.expectedStatuses) > 0 {
 		successful = contains(req.expectedStatuses, res.StatusCode)
 	} else {
-		successful = res.StatusCode >= 200 && res.StatusCode < 300
+		successful = res.StatusCode >= http.StatusOK &&
+			res.StatusCode < http.StatusMultipleChoices
 	}
 
 	if !successful {
 		var handler ErrorHandlerFunc
-		if req.errorHandler != nil {
+
+		switch {
+		case req.errorHandler != nil:
 			handler = req.errorHandler
-		} else if req.cli.errorHandler != nil {
+		case req.cli.errorHandler != nil:
 			handler = req.cli.errorHandler
-		} else {
+		default:
 			handler = defaultErrorHandler
 		}
+
 		return handler(
 			res.StatusCode,
 			res.Header.Get("Content-Type"),
@@ -595,23 +885,54 @@ func (req *HTTPRequest) RunContext(ctx context.Context) error {
 
 	// what are we loading the response into and how? make sure we're only
 	// doing this if there is a response content
-	if res.StatusCode != http.StatusNoContent && req.into != nil && (res.Header.Get("Content-Length") == "" || res.ContentLength > 0) {
+	if res.StatusCode != http.StatusNoContent &&
+		req.into != nil &&
+		(res.Header.Get("Content-Length") == "" || res.ContentLength > 0) {
 		var handler BodyHandlerFunc
-		if req.bodyHandler != nil {
+
+		switch {
+		case req.bodyHandler != nil:
 			handler = req.bodyHandler
-		} else if req.cli.bodyHandler != nil {
+		case req.cli.bodyHandler != nil:
 			handler = req.cli.bodyHandler
-		} else {
+		default:
 			handler = defaultBodyHandler
 		}
-		err = handler(
+
+		return handler(
 			res.StatusCode,
 			res.Header.Get("Content-Type"),
 			res.Body,
 			req.into,
 		)
 	}
-	return err
+
+	return nil
+}
+
+func setBasicAuth(req *HTTPRequest, r *http.Request) {
+	// take user, password and authentication header from the
+	// request if provided, otherwise from the client
+	user := req.authUser
+	if user == "" {
+		user = req.cli.authUser
+	}
+
+	pass := req.authPass
+	if pass == "" {
+		pass = req.cli.authPass
+	}
+
+	header := req.authHeader
+	if header == "" {
+		header = req.cli.authHeader
+	}
+
+	if header == "" {
+		header = defaultAuthHeader
+	}
+
+	r.Header.Add(header, "Basic "+base64.StdEncoding.EncodeToString([]byte(user+":"+pass)))
 }
 
 func defaultBodyHandler(
@@ -625,25 +946,25 @@ func defaultBodyHandler(
 	case "text/plain":
 		v := reflect.ValueOf(target)
 		if v.Kind() != reflect.Ptr || v.IsNil() {
-			return errors.Wrap(err, "invalid target variable")
+			return fmt.Errorf("invalid target variable: %w", err)
 		}
 
 		data, err := ioutil.ReadAll(body)
 		if err != nil {
-			return errors.Wrap(err, "failed reading server response")
+			return fmt.Errorf("failed reading server response: %w", err)
 		}
 
 		switch v := target.(type) {
 		case *string:
 			*v = strings.TrimRightFunc(string(data), unicode.IsSpace)
 		default:
-			return errors.New("target variable is not a string pointer")
+			return ErrNotAPointer
 		}
 	default:
 		// default to JSON, regardless of returned Content-Type
 		err = json.NewDecoder(body).Decode(target)
 		if err != nil {
-			return errors.Wrap(err, "failed decoding server response")
+			return fmt.Errorf("failed decoding server response: %w", err)
 		}
 	}
 
@@ -655,30 +976,32 @@ func defaultErrorHandler(
 	_ string,
 	_ io.Reader,
 ) (err error) {
-	return errors.Errorf("server returned unexpected status %d", status)
+	// nolint: goerr113
+	return fmt.Errorf("server returned unexpected status %d", status)
 }
 
-func DefaultTransport(tlsNoVerify bool, renegotiationSupport tls.RenegotiationSupport) http.RoundTripper {
-	// this is a modification of Golang's default HTTP transport
-	// (https://golang.org/pkg/net/http/#RoundTripper) with options
-	// to ignore invalid or self-signed TLS certificates and to configure
-	// timeouts.
-	// see https://blog.cloudflare.com/the-complete-guide-to-golang-net-http-timeouts/
-	// for more details about client timeouts
-
-	var tlsConfig *tls.Config
-	tlsConfig = &tls.Config{
+// defaultTransport returns the library's default HTTP transport. It is a
+// modification of Go's default transport (https://golang.org/pkg/net/http/#RoundTripper)
+// with options to ignore invalid or self-signed TLS certificates and to
+// configure timeouts.
+// See https://blog.cloudflare.com/the-complete-guide-to-golang-net-http-timeouts/
+// for more details about client timeouts.
+func defaultTransport(
+	tlsNoVerify bool,
+	renegotiationSupport tls.RenegotiationSupport,
+) http.RoundTripper {
+	return buildTransport(&tls.Config{
 		InsecureSkipVerify: tlsNoVerify,
 		Renegotiation:      renegotiationSupport,
-	}
-
-	var transport http.RoundTripper = buildTransport(tlsConfig)
-	return transport
+	})
 }
 
-func TLSTransport(certPEMBlock, keyPEMBlock, caCert []byte, TLSNoVerify bool, renegotiationSupport tls.RenegotiationSupport) http.RoundTripper {
-
-	// Load client Certificate
+func tlsTransport(
+	certPEMBlock, keyPEMBlock, caCert []byte,
+	tlsNoVerify bool,
+	renegotiationSupport tls.RenegotiationSupport,
+) http.RoundTripper {
+	// Load client certificate
 	cert, err := tls.X509KeyPair(certPEMBlock, keyPEMBlock)
 	if err != nil {
 		log.Fatal(err)
@@ -687,22 +1010,21 @@ func TLSTransport(certPEMBlock, keyPEMBlock, caCert []byte, TLSNoVerify bool, re
 	caCertPool := x509.NewCertPool()
 	caCertPool.AppendCertsFromPEM(caCert)
 
-	var tlsConfig *tls.Config
-	// Setup HTTPS client
-	tlsConfig = &tls.Config{
+	// setup HTTPS client
+	tlsConfig := &tls.Config{
 		Certificates:       []tls.Certificate{cert},
 		RootCAs:            caCertPool,
-		InsecureSkipVerify: TLSNoVerify,
+		InsecureSkipVerify: tlsNoVerify,
 		Renegotiation:      renegotiationSupport,
 	}
 	tlsConfig.BuildNameToCertificate()
 
-	var transport http.RoundTripper = buildTransport(tlsConfig)
-	return transport
+	return buildTransport(tlsConfig)
 }
 
 func buildTransport(tlsconfig *tls.Config) http.RoundTripper {
-	var transport http.RoundTripper = &http.Transport{
+	// nolint: gomnd
+	return &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second, // time spent establishing a TCP connection (if a new one is needed)
@@ -715,7 +1037,6 @@ func buildTransport(tlsconfig *tls.Config) http.RoundTripper {
 		ExpectContinueTimeout: 1 * time.Second,
 		TLSClientConfig:       tlsconfig,
 	}
-	return transport
 }
 
 func contains(slice []int, wanted int) bool {
@@ -724,5 +1045,6 @@ func contains(slice []int, wanted int) bool {
 			return true
 		}
 	}
+
 	return false
 }

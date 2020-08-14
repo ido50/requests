@@ -1,0 +1,49 @@
+run:
+    tests: false
+    timeout: 5m
+linters:
+    disable-all: true
+    enable:
+        - govet
+        - errcheck
+        - staticcheck
+        - unused
+        - gosimple
+        - structcheck
+        - varcheck
+        - ineffassign
+        - deadcode
+        - typecheck
+        - stylecheck
+        - interfacer
+        - unconvert
+        - dupl
+        - goconst
+        - gocyclo
+        - gocognit
+        - asciicheck
+        - goimports
+        - goheader
+        - maligned
+        - misspell
+        - lll
+        - unparam
+        - nakedret
+        - prealloc
+        - scopelint
+        - gocritic
+        - funlen
+        - whitespace
+        - wsl
+        - goprintffuncname
+        - gomnd
+        - goerr113
+        - nestif
+        - exportloopref
+        - exhaustive
+        - bodyclose
+        - nolintlint
+linters-settings:
+    funlen:
+        lines: 150
+        statements: 80
