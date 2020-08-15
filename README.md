@@ -4,6 +4,7 @@
 	<a href="https://godoc.org/github.com/ido50/requests"><img src="https://img.shields.io/badge/godoc-reference-blue.svg"></a>
     <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg"></a>
 	<a href="https://goreportcard.com/report/ido50/requests"><img src="https://goreportcard.com/badge/github.com/ido50/requests"></a>
+    <a href="https://github.com/ido50/requests/actions"><img src="https://github.com/ido50/requests/workflows/build/badge.svg"></a>
 </p>
 
 ---
@@ -25,7 +26,9 @@ and all generated requests will automatically include them.
 
 # Install
 
-`go get -u github.com/ido50/requests`
+```
+go get -u github.com/ido50/requests
+```
 
 # Usage
 

@@ -403,8 +403,8 @@ func (cli *HTTPClient) SetRenegotiation(support tls.RenegotiationSupport) *HTTPC
 	return cli
 }
 
-// SetTLS, together with NoTLSVerify and SetRenegotiation, allows creating a
-// custom TLS transport.
+// SetTLS allows creating a custom TLS transport. Often combined with
+// SetRenegotiation.
 func (cli *HTTPClient) SetTLS(
 	certPEMBlock, keyPEMBlock, caCert []byte,
 ) *HTTPClient {
@@ -644,7 +644,7 @@ func (req *HTTPRequest) StatusInto(into *int) *HTTPRequest {
 	return req
 }
 
-// Cookies into allows storing cookies in the response into a slice of cookies.
+// CookiesInto allows storing cookies in the response into a slice of cookies.
 // The same comments as for HeaderInto apply here as well.
 func (req *HTTPRequest) CookiesInto(into *[]*http.Cookie) *HTTPRequest {
 	req.cookiesInto = into
