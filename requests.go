@@ -419,22 +419,29 @@ func (cli *HTTPClient) SetTLS(
 // method was added so that an HTTPClient object will implement a common interface
 // for HTTP clients. Generally, there is no need to use this method.
 func (cli *HTTPClient) Do(req *http.Request) (*http.Response, error) {
+	ctx := context.Background()
+
+	if cli.timeout > 0 {
+		var cancel context.CancelFunc
+
+		ctx, cancel = context.WithTimeout(ctx, cli.timeout)
+		defer cancel()
+	}
+
 	return cli.retryRequest(
-		context.Background(),
+		ctx,
 		cli.logger,
 		req,
 		nil,
-		cli.timeout,
 		cli.retryLimit+1,
 	)
 }
 
 func (cli *HTTPClient) retryRequest(
-	parentCtx context.Context,
+	ctx context.Context,
 	logger *zap.Logger,
 	req *http.Request,
 	body []byte,
-	timeout time.Duration,
 	attempts uint8,
 ) (res *http.Response, err error) {
 	if cli.httpCli == nil {
@@ -466,7 +473,17 @@ func (cli *HTTPClient) retryRequest(
 			req.Body = ioutil.NopCloser(bytes.NewBuffer(body))
 		}
 
-		res, err = cli.doRequest(parentCtx, req, timeout)
+		req = req.WithContext(ctx)
+
+		res, err = cli.httpCli.Do(req)
+		if err != nil {
+			if urlErr, ok := err.(*url.Error); ok {
+				if errors.Is(urlErr.Err, context.DeadlineExceeded) {
+					err = ErrTimeoutReached
+				}
+			}
+		}
+
 		// we retry requests if an error is returned from net/http, or if
 		// the status of the response is 502, 503 or 504, which are all proxy
 		// errors that may be temporary
@@ -493,33 +510,6 @@ func (cli *HTTPClient) retryRequest(
 			)
 			time.Sleep(delay)
 			delay *= 2
-		}
-	}
-
-	return res, err
-}
-
-func (cli *HTTPClient) doRequest(
-	parentCtx context.Context,
-	req *http.Request,
-	timeout time.Duration,
-) (res *http.Response, err error) {
-	// initiate the request
-	req = req.WithContext(parentCtx)
-
-	if timeout > 0 {
-		ctx, cancel := context.WithTimeout(parentCtx, timeout)
-		defer cancel()
-
-		req = req.WithContext(ctx)
-	}
-
-	res, err = cli.httpCli.Do(req)
-	if err != nil {
-		if urlErr, ok := err.(*url.Error); ok {
-			if errors.Is(urlErr.Err, context.DeadlineExceeded) {
-				err = ErrTimeoutReached
-			}
 		}
 	}
 
@@ -750,8 +740,15 @@ func (req *HTTPRequest) RunContext(ctx context.Context) error {
 		timeout = req.cli.timeout
 	}
 
+	if timeout > 0 {
+		var cancel context.CancelFunc
+
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
 	// run the request
-	res, err := req.cli.retryRequest(ctx, req.logger, r, req.body, timeout, attempts)
+	res, err := req.cli.retryRequest(ctx, req.logger, r, req.body, attempts)
 	if err != nil {
 		if errors.Is(err, ErrTimeoutReached) {
 			return err
