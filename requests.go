@@ -267,6 +267,10 @@ func (cli *HTTPClient) retryRequest(
 
 		// failed this attempt, sleep 2*attempt seconds and try again
 		if attempt < attempts {
+			// make sure to close the body
+			if res != nil {
+				closeBody(res.Body)
+			}
 			logger.Debug(
 				"Request failed, will retry",
 				zap.Uint8("attempt", attempt),
@@ -541,10 +545,7 @@ func (req *HTTPRequest) RunContext(ctx context.Context) error {
 	// make sure to read the entire body and close the request once we're
 	// done, this is important in order to reuse connections and prevent
 	// connection leaks
-	defer func() {
-		io.Copy(ioutil.Discard, res.Body)
-		res.Body.Close()
-	}()
+	defer closeBody(res.Body)
 
 	if req.sizeLimit > 0 && res.ContentLength > req.sizeLimit {
 		return ErrSizeExceeded
@@ -724,4 +725,10 @@ func contains(slice []int, wanted int) bool {
 		}
 	}
 	return false
+}
+
+func closeBody(body io.ReadCloser) {
+	// nolint: errcheck
+	io.Copy(ioutil.Discard, body)
+	body.Close()
 }
