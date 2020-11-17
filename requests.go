@@ -485,11 +485,12 @@ func (cli *HTTPClient) retryRequest(
 		}
 
 		// we retry requests if an error is returned from net/http, or if
-		// the status of the response is 502, 503 or 504, which are all proxy
+		// the status of the response is 502, 503, 429 or 504, which are all proxy
 		// errors that may be temporary
 		if err == nil &&
 			res.StatusCode != http.StatusBadGateway &&
 			res.StatusCode != http.StatusServiceUnavailable &&
+			res.StatusCode != http.StatusTooManyRequests &&
 			res.StatusCode != http.StatusGatewayTimeout {
 			break
 		}
