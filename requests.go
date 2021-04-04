@@ -74,6 +74,8 @@ package requests
 
 import (
 	"bytes"
+	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -103,6 +105,21 @@ const (
 )
 
 const defaultAuthHeader = "Authorization"
+
+// CompressionAlgorithm denotes compression algorithms supported by the library
+// for compressed request bodies.
+type CompressionAlgorithm string
+
+const (
+	// CompressionAlgorithmNone represents no compression
+	CompressionAlgorithmNone CompressionAlgorithm = ""
+
+	// CompressionAlgorithmGzip represents the gzip compression algorithm
+	CompressionAlgorithmGzip CompressionAlgorithm = "gzip"
+
+	// CompressionAlgorithmDeflate represents the deflate compression algorithm
+	CompressionAlgorithmDeflate CompressionAlgorithm = "deflate"
+)
 
 // HTTPClient represents a client for making requests to a web service or
 // website. The client includes default options that are relevant for all
@@ -147,6 +164,9 @@ type HTTPClient struct {
 
 	// default retry limit for all requests
 	retryLimit uint8
+
+	// optional compression algorithm for all requests
+	compressionAlgorithm CompressionAlgorithm
 
 	// logger to use (only debug messages are printed by the library; defaults to noop logger)
 	logger *zap.Logger
@@ -224,6 +244,9 @@ type HTTPRequest struct {
 	// reject responses whose body size exceeds this value
 	sizeLimit int64
 
+	// optional compression algorithm for the request
+	compressionAlgorithm CompressionAlgorithm
+
 	// error handler for the request if returned status is not the expected one(s)
 	errorHandler ErrorHandlerFunc
 
@@ -267,6 +290,10 @@ var (
 	// ErrNotAPointer is an error returned when the target variable provided for
 	// a request's Run method is not a pointer.
 	ErrNotAPointer = errors.New("target variable is not a string pointer")
+
+	// ErrUnsupportedCompression is an error returned when attempting to send
+	// requests with a compression algorithm unsupported by the library
+	ErrUnsupportedCompression = errors.New("unsupported compression algorithm")
 )
 
 // DefaultTimeout is the default timeout for requests made by the library. This
@@ -356,6 +383,16 @@ func (cli *HTTPClient) Header(key, value string) *HTTPClient {
 
 	cli.customHeaders[key] = value
 
+	return cli
+}
+
+// CompressWith sets a compression algorithm to apply to all request bodies.
+// Compression is optional, in that if it fails, for any reason, requests will
+// not fail, but instead be sent without compression.
+// Note that there is no need to use this to support decompression of responses,
+// the library handles decompressions automatically.
+func (cli *HTTPClient) CompressWith(alg CompressionAlgorithm) *HTTPClient {
+	cli.compressionAlgorithm = alg
 	return cli
 }
 
@@ -694,6 +731,16 @@ func (req *HTTPRequest) Header(key, value string) *HTTPRequest {
 	return req
 }
 
+// CompressWith sets a compression algorithm to apply to all request bodies.
+// Compression is optional, in that if it fails, for any reason, requests will
+// not fail, but instead be sent without compression.
+// Note that there is no need to use this to support decompression of responses,
+// the library handles decompressions automatically.
+func (req *HTTPRequest) CompressWith(alg CompressionAlgorithm) *HTTPRequest {
+	req.compressionAlgorithm = alg
+	return req
+}
+
 // ErrorHandler sets a custom error handler for the request.
 func (req *HTTPRequest) ErrorHandler(handler ErrorHandlerFunc) *HTTPRequest {
 	req.errorHandler = handler
@@ -832,7 +879,59 @@ func (req *HTTPRequest) createRequest() (r *http.Request, err error) {
 
 	r.Header.Add("Accept", req.accept)
 
+	// are we compressing requests
+	err = req.compress(r)
+	if err != nil {
+		// log this, but do not fail
+		req.logger.Warn(
+			"Failed compressing request, will send uncompressed",
+			zap.Error(err),
+		)
+	}
+
 	return r, nil
+}
+
+func (req *HTTPRequest) compress(r *http.Request) error {
+	alg := req.cli.compressionAlgorithm
+	if req.compressionAlgorithm != CompressionAlgorithmNone {
+		alg = req.compressionAlgorithm
+	}
+
+	if req.body == nil || len(req.body) == 0 {
+		return nil
+	}
+
+	var buf bytes.Buffer
+
+	var w io.WriteCloser
+
+	switch alg {
+	case CompressionAlgorithmGzip:
+		w = gzip.NewWriter(&buf)
+	case CompressionAlgorithmDeflate:
+		w = zlib.NewWriter(&buf)
+	case CompressionAlgorithmNone:
+		return nil
+	default:
+		return fmt.Errorf("%w: %q", ErrUnsupportedCompression, alg)
+	}
+
+	_, err := w.Write(req.body)
+	if err != nil {
+		return fmt.Errorf("failed encoding body to %s: %w", alg, err)
+	}
+
+	err = w.Close()
+	if err != nil {
+		return fmt.Errorf("failed closing compressed body: %w", err)
+	}
+
+	req.body = buf.Bytes()
+
+	r.Header.Set("Content-Encoding", string(alg))
+
+	return nil
 }
 
 func (req *HTTPRequest) parseResponse(res *http.Response) error {

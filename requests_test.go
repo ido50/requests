@@ -1,6 +1,7 @@
 package requests
 
 import (
+	"compress/gzip"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -302,4 +303,48 @@ func rot13(b []byte) []byte {
 	}
 
 	return b
+}
+
+func TestCompressedRequest(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		cr, err := gzip.NewReader(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, "Failed creating gzip reader: %s\n", err)
+			return
+		}
+
+		defer cr.Close()
+
+		content, err := io.ReadAll(cr)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, "Failed reading request body: %s\n", err)
+			return
+		}
+
+		fmt.Fprintln(w, string(content))
+	}))
+
+	defer ts.Close()
+
+	cli := NewClient(ts.URL).
+		Accept("text/plain").
+		CompressWith(CompressionAlgorithmGzip)
+
+	for i, input := range []string{"hello world", "bla", "AAABBb"} {
+		var output string
+		err := cli.NewRequest("GET", "/").
+			Into(&output).
+			Body([]byte(input), "text/plain").
+			Run()
+		if err != nil {
+			t.Fatalf("Failed request: %s", err)
+		}
+
+		if output != input {
+			t.Errorf("Compression test %d: got %+q, expected %+q", i, output, input)
+		}
+	}
 }
