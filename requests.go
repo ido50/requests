@@ -415,8 +415,10 @@ func (cli *HTTPClient) BodyHandler(handler BodyHandlerFunc) *HTTPClient {
 	return cli
 }
 
-func (cli *HTTPClient) CustomHTTPClient(cl *http.Client) {
+// CustomHTTPClient sets a custom HTTP client for the underlaying net layer
+func (cli *HTTPClient) CustomHTTPClient(cl *http.Client) *HTTPClient {
 	cli.httpCli = cl
+	return cli
 }
 
 // NoTLSVerify allows ignoring invalid or self-signed TLS certificates presented
