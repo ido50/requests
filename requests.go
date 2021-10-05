@@ -432,6 +432,12 @@ func (req *HTTPRequest) BodyHandler(handler BodyHandlerFunc) *HTTPRequest {
 	return req
 }
 
+// CustomHTTPClient sets a custom HTTP client for the underlaying net layer
+func (cli *HTTPClient) CustomHTTPClient(cl *http.Client) *HTTPClient {
+	cli.httpCli = cl
+	return cli
+}
+
 func (req *HTTPRequest) Run() error {
 	return req.RunContext(context.Background())
 }
