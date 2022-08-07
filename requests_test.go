@@ -1,16 +1,23 @@
 package requests
 
 import (
+	"bytes"
 	"compress/gzip"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/jgroeneveld/trial/assert"
+	"github.com/spf13/afero"
 )
 
 func TestPlainTextResponse(t *testing.T) {
@@ -194,11 +201,11 @@ func TestCustomBodyHandler(t *testing.T) {
 		NewRequest("GET", "/").
 		BodyHandler(func(status int, cType string, reader io.Reader, target interface{}) error {
 			if cType != "application/x.rot13" {
-				return errors.Errorf("unexpected content type %s returned", cType)
+				return fmt.Errorf("unexpected content type %s returned", cType)
 			}
 			b, err := ioutil.ReadAll(reader)
 			if err != nil {
-				return errors.Wrap(err, "failed reading response body")
+				return fmt.Errorf("failed reading response body: %w", err)
 			}
 			t := target.(*[]byte)
 			*t = rot13(b[:len(b)-1]) // chomp newline
@@ -287,7 +294,6 @@ aUz5HXBcNYdNTwmMhJeR+2PjQLwK8XKQyR/OXPwgpDhYdpI8jx4AV4VakekES2Mx
 	if status != 200 {
 		t.Errorf("Failed to read status: got %d, expected 200", status)
 	}
-
 }
 
 func rot13(b []byte) []byte {
@@ -347,4 +353,193 @@ func TestCompressedRequest(t *testing.T) {
 			t.Errorf("Compression test %d: got %+q, expected %+q", i, output, input)
 		}
 	}
+}
+
+func TestBodySources(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", r.Header.Get("Content-Type"))
+		w.WriteHeader(http.StatusOK)
+		io.ReadAll(io.TeeReader(r.Body, w))
+	}))
+
+	defer ts.Close()
+
+	var testFS = afero.NewMemMapFs()
+	err := afero.WriteFile(testFS, "hello", []byte("Hello world"), 0655)
+	assert.MustBeNil(t, err, "must create file successfully")
+
+	cli := NewClient(ts.URL)
+
+	type bodySrcTest struct {
+		desc        string
+		body        interface{}
+		file        string
+		contentType string
+		expErr      error
+		expBody     string
+	}
+
+	for _, test := range []bodySrcTest{
+		{
+			desc:        "A []byte value",
+			body:        []byte("Hello world"),
+			contentType: "text/plain",
+			expBody:     "Hello world",
+		},
+		{
+			desc:        "A string value",
+			body:        "Hello world",
+			contentType: "text/plain",
+			expBody:     "Hello world",
+		},
+		{
+			desc:        "A simple io.Reader",
+			body:        bytes.NewReader([]byte("Hello world")),
+			contentType: "text/plain",
+			expBody:     "Hello world",
+		},
+		{
+			desc:        "A simple io.ReadCloser",
+			body:        ioutil.NopCloser(bytes.NewReader([]byte("Hello world"))),
+			contentType: "text/plain",
+			expBody:     "Hello world",
+		},
+		{
+			desc:        "An unsupported value",
+			body:        3,
+			contentType: "text/plain",
+			expErr:      ErrUnsupportedBody,
+		},
+		{
+			desc:        "A file",
+			file:        "hello",
+			contentType: "text/plain",
+			expBody:     "Hello world",
+		},
+		{
+			desc:        "A non-existent file",
+			file:        "doesnt-exist",
+			contentType: "text/plain",
+			expErr:      errors.New("file does not exist"),
+		},
+	} {
+		var resBody, resContentType string
+		req := cli.NewRequest("POST", "/").
+			Accept(test.contentType).
+			Into(&resBody).
+			HeaderInto("Content-Type", &resContentType)
+
+		if test.file != "" {
+			req.FileBody(afero.NewIOFS(testFS), test.file, "text/plain")
+		} else {
+			req.Body(test.body, test.contentType)
+		}
+
+		err := req.Run()
+
+		if test.expErr != nil {
+			assert.MustNotBeNil(t, err)
+			assert.MustBeTrue(
+				t,
+				errors.Is(
+					err,
+					test.expErr) ||
+					strings.Contains(err.Error(), test.expErr.Error()),
+			)
+		} else {
+			assert.MustBeNil(t, err)
+			assert.MustBeEqual(t, test.contentType, resContentType)
+			assert.MustBeEqual(t, test.expBody, resBody)
+		}
+	}
+}
+
+func TestMultipartBody(t *testing.T) {
+	type part struct {
+		Fieldname string `json:"fieldname"`
+		Filename  string `json:"filename"`
+		Content   string `json:"content"`
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(
+				w,
+				"Invalid content type %q: %s",
+				r.Header.Get("Content-Type"), err,
+			)
+			return
+		}
+
+		mr := multipart.NewReader(r.Body, params["boundary"])
+		var output []part
+		for {
+			p, err := mr.NextPart()
+			if err == io.EOF {
+				break
+			} else if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprintf(w, "Failed getting next part: %s", err)
+				return
+			}
+
+			b, err := io.ReadAll(p)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprintf(w, "Failed reading part body: %s", err)
+				return
+			}
+
+			output = append(output, part{
+				Fieldname: p.FormName(),
+				Filename:  p.FileName(),
+				Content:   string(b),
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(output)
+	}))
+
+	defer ts.Close()
+
+	var testFS = afero.NewMemMapFs()
+	err := afero.WriteFile(testFS, "hello", []byte("HELLO"), 0655)
+	assert.MustBeNil(t, err, "must create file successfully")
+	err = afero.WriteFile(testFS, "world", []byte("WORLD"), 0655)
+	assert.MustBeNil(t, err, "must create file successfully")
+
+	var res []part
+
+	iofs := afero.NewIOFS(testFS)
+
+	err = NewClient(ts.URL).NewRequest("POST", "/").
+		Into(&res).
+		MultipartBody(
+			MultipartPart("header", "title.txt", "Hello world"),
+			MultipartFile("body", iofs, "hello"),
+			MultipartFile("footer", iofs, "world"),
+		).
+		Run()
+
+	assert.MustBeNil(t, err)
+	assert.MustBeDeepEqual(t, []part{
+		{
+			Fieldname: "header",
+			Filename:  "title.txt",
+			Content:   "Hello world",
+		},
+		{
+			Fieldname: "body",
+			Filename:  "hello",
+			Content:   "HELLO",
+		},
+		{
+			Fieldname: "footer",
+			Filename:  "world",
+			Content:   "WORLD",
+		},
+	}, res)
 }

@@ -84,11 +84,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"log"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
+	pathtools "path/filepath"
 	"reflect"
 	"strings"
 	"time"
@@ -196,10 +199,15 @@ type HTTPRequest struct {
 	// content type of the request's body
 	contentType string
 
-	// reader for the request's body
-	body []byte
+	// bodySrc is a ReadCloser from which the request's body is read by us
+	bodySrc io.ReadCloser
 
-	// pointer to a variable where the response will be loaded into
+	// bodyDst is a buffer into which the final request body is written (i.e.
+	// after optional compression or other processing), and which is read by the
+	// underlying net/http client
+	bodyDst bytes.Buffer
+
+	// pointer to a variable where the response body will be loaded into
 	into interface{}
 
 	// map of header names to pointers where response header values will be loaded into
@@ -294,6 +302,11 @@ var (
 	// ErrUnsupportedCompression is an error returned when attempting to send
 	// requests with a compression algorithm unsupported by the library
 	ErrUnsupportedCompression = errors.New("unsupported compression algorithm")
+
+	// ErrUnsupportedBody is an error returned when the value provided to the
+	// request's Body method is unsupported, i.e. it is not a byte string, a
+	// string, or a reader
+	ErrUnsupportedBody = errors.New("unsupported body")
 )
 
 // DefaultTimeout is the default timeout for requests made by the library. This
@@ -484,7 +497,7 @@ func (cli *HTTPClient) retryRequest(
 	ctx context.Context,
 	logger *zap.Logger,
 	req *http.Request,
-	body []byte,
+	body *bytes.Buffer,
 	attempts uint8,
 ) (res *http.Response, err error) {
 	if cli.httpCli == nil {
@@ -513,7 +526,7 @@ func (cli *HTTPClient) retryRequest(
 
 	for attempt := uint8(1); attempt <= attempts; attempt++ {
 		if body != nil {
-			req.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+			req.Body = ioutil.NopCloser(body)
 		}
 
 		req = req.WithContext(ctx)
@@ -598,10 +611,21 @@ func (req *HTTPRequest) Cookie(cookie *http.Cookie) *HTTPRequest {
 	return req
 }
 
-// Body sets a custom body for the request. The content type of the data must
-// be provided.
-func (req *HTTPRequest) Body(body []byte, contentType string) *HTTPRequest {
-	req.body = body
+// ReaderBody sets a custom body for the request from an io.ReadCloser,
+// io.Reader, []byte or string. The content type of the data must be provided.
+func (req *HTTPRequest) Body(body interface{}, contentType string) *HTTPRequest {
+	if rc, ok := body.(io.ReadCloser); ok {
+		req.bodySrc = rc
+	} else if r, ok := body.(io.Reader); ok {
+		req.bodySrc = ioutil.NopCloser(r)
+	} else if b, ok := body.([]byte); ok {
+		req.bodySrc = ioutil.NopCloser(bytes.NewReader(b))
+	} else if s, ok := body.(string); ok {
+		req.bodySrc = ioutil.NopCloser(strings.NewReader(s))
+	} else {
+		req.err = ErrUnsupportedBody
+	}
+
 	req.contentType = contentType
 
 	return req
@@ -610,16 +634,112 @@ func (req *HTTPRequest) Body(body []byte, contentType string) *HTTPRequest {
 // JSONBody encodes the provided Go value into JSON and sets it as the request
 // body.
 func (req *HTTPRequest) JSONBody(body interface{}) *HTTPRequest {
-	var err error
-
-	req.body, err = json.Marshal(body)
+	encodedBody, err := json.Marshal(body)
 	if err != nil {
-		req.err = fmt.Errorf("failed processing JSON body: %w", err)
+		req.err = fmt.Errorf("failed encoding JSON body: %w", err)
 	}
 
-	req.contentType = "application/json; charset=UTF-8"
+	return req.Body(encodedBody, "application/json; charset=UTF-8")
+}
+
+// FileBody sets the request body to be read from the provided filesystem and
+// file path. The content type must be provided.
+func (req *HTTPRequest) FileBody(fsys fs.FS, filepath, contentType string) *HTTPRequest {
+	var err error
+	req.bodySrc, err = fsys.Open(filepath)
+	if err != nil {
+		req.err = fmt.Errorf("failed opening body file %q: %w", filepath, err)
+	}
+
+	req.contentType = contentType
 
 	return req
+}
+
+// MultipartBody creates a multipart/form-data body from one or more sources,
+// which may be file objects, bytes, strings or any reader.
+func (req *HTTPRequest) MultipartBody(srcs ...*multipartSrc) *HTTPRequest {
+	var output bytes.Buffer
+	writer := multipart.NewWriter(&output)
+
+	for _, src := range srcs {
+		formFile, err := writer.CreateFormFile(src.fieldname, src.filename)
+		if err != nil {
+			req.err = fmt.Errorf(
+				"failed creating form file %q: %w",
+				src.fieldname, err,
+			)
+			return req
+		}
+
+		var srcReader io.ReadCloser
+		if src.filepath != "" {
+			srcReader, err = src.filesystem.Open(src.filepath)
+			if err != nil {
+				req.err = fmt.Errorf(
+					"failed opening source file %q: %w",
+					src.filepath, err,
+				)
+				return req
+			}
+		} else {
+			if rc, ok := src.body.(io.ReadCloser); ok {
+				srcReader = rc
+			} else if r, ok := src.body.(io.Reader); ok {
+				srcReader = ioutil.NopCloser(r)
+			} else if b, ok := src.body.([]byte); ok {
+				srcReader = ioutil.NopCloser(bytes.NewReader(b))
+			} else if s, ok := src.body.(string); ok {
+				srcReader = ioutil.NopCloser(strings.NewReader(s))
+			} else {
+				req.err = ErrUnsupportedBody
+				return req
+			}
+		}
+
+		_, err = io.Copy(formFile, srcReader)
+		srcReader.Close()
+		if err != nil {
+			req.err = fmt.Errorf(
+				"failed reading form file %q: %w",
+				src.fieldname, err,
+			)
+			return req
+		}
+	}
+
+	err := writer.Close()
+	if err != nil {
+		req.err = fmt.Errorf("failed closing multipart message: %w", err)
+		return req
+	}
+
+	return req.Body(&output, writer.FormDataContentType())
+}
+
+type multipartSrc struct {
+	fieldname  string
+	filename   string
+	body       interface{}
+	filesystem fs.FS
+	filepath   string
+}
+
+// MultipartPart adds a new part to a multipart request with the provided field
+// name, file name, and body, which may be a []byte value, a string, or a reader.
+func MultipartPart(fieldname, filename string, body interface{}) *multipartSrc {
+	return &multipartSrc{fieldname: fieldname, filename: filename, body: body}
+}
+
+// MultipartFile adds a new part to a multipart request from the provided file
+// in a filesystem.
+func MultipartFile(fieldname string, fsys fs.FS, filepath string) *multipartSrc {
+	return &multipartSrc{
+		fieldname:  fieldname,
+		filename:   pathtools.Base(filepath),
+		filesystem: fsys,
+		filepath:   filepath,
+	}
 }
 
 // Accept sets the accepted MIME type for the request. This takes precedence
@@ -802,7 +922,7 @@ func (req *HTTPRequest) RunContext(ctx context.Context) error {
 	}
 
 	// run the request
-	res, err := req.cli.retryRequest(ctx, req.logger, r, req.body, attempts)
+	res, err := req.cli.retryRequest(ctx, req.logger, r, &req.bodyDst, attempts)
 	if err != nil {
 		if errors.Is(err, ErrTimeoutReached) {
 			return err
@@ -904,38 +1024,39 @@ func (req *HTTPRequest) compress(r *http.Request) error {
 		alg = req.compressionAlgorithm
 	}
 
-	if req.body == nil || len(req.body) == 0 {
+	if req.bodySrc == nil {
 		return nil
 	}
 
-	var buf bytes.Buffer
-
-	var w io.WriteCloser
+	var compressor io.Writer
 
 	switch alg {
 	case CompressionAlgorithmGzip:
-		w = gzip.NewWriter(&buf)
+		w := gzip.NewWriter(&req.bodyDst)
+		defer w.Close()
+		compressor = w
 	case CompressionAlgorithmDeflate:
-		w = zlib.NewWriter(&buf)
+		w := zlib.NewWriter(&req.bodyDst)
+		defer w.Close()
+		compressor = w
 	case CompressionAlgorithmNone:
-		return nil
+		compressor = &req.bodyDst
 	default:
 		return fmt.Errorf("%w: %q", ErrUnsupportedCompression, alg)
 	}
 
-	_, err := w.Write(req.body)
+	tee := io.TeeReader(req.bodySrc, compressor)
+
+	defer req.bodySrc.Close()
+
+	_, err := io.ReadAll(tee)
 	if err != nil {
-		return fmt.Errorf("failed encoding body to %s: %w", alg, err)
+		return fmt.Errorf("failed compressing body via %s: %w", alg, err)
 	}
 
-	err = w.Close()
-	if err != nil {
-		return fmt.Errorf("failed closing compressed body: %w", err)
+	if alg != CompressionAlgorithmNone {
+		r.Header.Set("Content-Encoding", string(alg))
 	}
-
-	req.body = buf.Bytes()
-
-	r.Header.Set("Content-Encoding", string(alg))
 
 	return nil
 }
