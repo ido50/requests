@@ -13,66 +13,63 @@
 // authorization headers and response handlers can be set in the client object,
 // and all generated requests will automatically include them.
 //
+// # Usage
 //
+//	package main
 //
-// Usage
+//	import (
+//		"fmt"
+//		"net/http"
+//		"time"
 //
+//		"github.com/ido50/requests"
+//	)
 //
+//	const apiURL = "https://my.api.com/v2"
 //
-//		package main
+//	type RequestBody struct {
+//		Title   string   `json:"title"`
+//		Tags    []string `json:"tags"`
+//		Publish bool     `json:"publish"`
+//	}
 //
-//		import (
-//			"fmt"
-//			"net/http"
-//			"time"
+//	type ResponseBody struct {
+//		ID   int64     `json:"id"`
+//		Date time.Time `json:"date"`
+//	}
 //
-//			"github.com/ido50/requests"
+//	func main() {
+//		client := requests.
+//			NewClient(apiURL).
+//			Accept("application/json").
+//			BasicAuth("user", "pass").
+//			RetryLimit(3)
+//
+//		var res ResponseBody
+//
+//		err := client.
+//			NewRequest("POST", "/articles").
+//			JSONBody(RequestBody{
+//				Title:   "Test Title",
+//				Tags:    []string{"test", "stories"},
+//				Publish: true,
+//			}).
+//			ExpectedStatus(http.StatusCreated).
+//			Into(&res).
+//			Run()
+//		if err != nil {
+//			panic(err)
+//		}
+//
+//		fmt.Printf(
+//			"Created article %d on %s\n",
+//			res.ID, res.Date.Format(time.RFC3339),
 //		)
-//
-//		const apiURL = "https://my.api.com/v2"
-//
-//		type RequestBody struct {
-//			Title   string   `json:"title"`
-//			Tags    []string `json:"tags"`
-//			Publish bool     `json:"publish"`
-//		}
-//
-//		type ResponseBody struct {
-//			ID   int64     `json:"id"`
-//			Date time.Time `json:"date"`
-//		}
-//
-//		func main() {
-//			client := requests.
-//				NewClient(apiURL).
-//				Accept("application/json").
-//				BasicAuth("user", "pass").
-//				RetryLimit(3)
-//
-//			var res ResponseBody
-//
-//			err := client.
-//				NewRequest("POST", "/articles").
-//				JSONBody(RequestBody{
-//					Title:   "Test Title",
-//					Tags:    []string{"test", "stories"},
-//					Publish: true,
-//				}).
-//				ExpectedStatus(http.StatusCreated).
-//				Into(&res).
-//				Run()
-//			if err != nil {
-//				panic(err)
-//			}
-//
-//			fmt.Printf(
-//				"Created article %d on %s\n",
-//				res.ID, res.Date.Format(time.RFC3339),
-//			)
-//		}
+//	}
 package requests
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"compress/zlib"
@@ -889,15 +886,87 @@ func (req *HTTPRequest) Run() error {
 // RunContext is the same as Run, but executes the request with the provided
 // context value.
 func (req *HTTPRequest) RunContext(ctx context.Context) error {
+	res, cancel, err := req.execute(ctx)
+	if err != nil {
+		return err
+	}
+
+    cancel()
+
+	// make sure to read the entire body and close the request once we're
+	// done, this is important in order to reuse connections and prevent
+	// connection leaks
+	defer closeBody(res.Body)
+
+	// make sure response size does not exceed the limit
+	if req.sizeLimit > 0 && res.ContentLength > req.sizeLimit {
+		return ErrSizeExceeded
+	}
+
+	return req.parseResponse(res)
+}
+
+// Issue the request, expecting a text/event-stream response, and subscribe to
+// that stream. Events (well, messages) from the server will be sent as-is to
+// the provided channel. When all messages have been read, the channel is
+// automatically closed.
+func (req *HTTPRequest) Subscribe(ctx context.Context, messages chan []byte) error {
+	req.Accept("text/event-stream")
+
+	res, cancel, err := req.execute(ctx)
+	if err != nil {
+		return err
+	}
+
+	err = req.parseResponse(res)
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		defer closeBody(res.Body)
+        defer cancel()
+
+		br := bufio.NewReader(res.Body)
+
+		for {
+			bs, err := br.ReadBytes('\n')
+			if err != nil && err != io.EOF {
+				log.Printf("ERROR: %s", err)
+				break
+			}
+
+			if len(bs) < 2 {
+				continue
+			}
+
+			messages <- bs
+
+			if err == io.EOF {
+				break
+			}
+		}
+
+		close(messages)
+	}()
+
+	return nil
+}
+
+func (req *HTTPRequest) execute(ctx context.Context) (
+	res *http.Response,
+	cancel context.CancelFunc,
+	err error,
+) {
 	// did we fail during building the request? if so, return the error
 	if req.err != nil {
-		return req.err
+		return nil, nil, req.err
 	}
 
 	// create the request
 	r, err := req.createRequest()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	// how many attempts are we gonna make?
@@ -915,33 +984,20 @@ func (req *HTTPRequest) RunContext(ctx context.Context) error {
 	}
 
 	if timeout > 0 {
-		var cancel context.CancelFunc
-
 		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
 	}
 
 	// run the request
-	res, err := req.cli.retryRequest(ctx, req.logger, r, &req.bodyDst, attempts)
+	res, err = req.cli.retryRequest(ctx, req.logger, r, &req.bodyDst, attempts)
 	if err != nil {
 		if errors.Is(err, ErrTimeoutReached) {
-			return err
+			return nil, nil, err
 		}
 
-		return fmt.Errorf("request failed: %w", err)
+		return nil, nil, fmt.Errorf("request failed: %w", err)
 	}
 
-	// make sure to read the entire body and close the request once we're
-	// done, this is important in order to reuse connections and prevent
-	// connection leaks
-	defer closeBody(res.Body)
-
-	// make sure response size does not exceed the limit
-	if req.sizeLimit > 0 && res.ContentLength > req.sizeLimit {
-		return ErrSizeExceeded
-	}
-
-	return req.parseResponse(res)
+	return res, cancel, nil
 }
 
 func (req *HTTPRequest) createRequest() (r *http.Request, err error) {
