@@ -891,7 +891,9 @@ func (req *HTTPRequest) RunContext(ctx context.Context) error {
 		return err
 	}
 
-    cancel()
+	if cancel != nil {
+		defer cancel()
+	}
 
 	// make sure to read the entire body and close the request once we're
 	// done, this is important in order to reuse connections and prevent
@@ -924,8 +926,11 @@ func (req *HTTPRequest) Subscribe(ctx context.Context, messages chan []byte) err
 	}
 
 	go func() {
+		if cancel != nil {
+			defer cancel()
+		}
+
 		defer closeBody(res.Body)
-        defer cancel()
 
 		br := bufio.NewReader(res.Body)
 
@@ -991,10 +996,10 @@ func (req *HTTPRequest) execute(ctx context.Context) (
 	res, err = req.cli.retryRequest(ctx, req.logger, r, &req.bodyDst, attempts)
 	if err != nil {
 		if errors.Is(err, ErrTimeoutReached) {
-			return nil, nil, err
+			return nil, cancel, err
 		}
 
-		return nil, nil, fmt.Errorf("request failed: %w", err)
+		return nil, cancel, fmt.Errorf("request failed: %w", err)
 	}
 
 	return res, cancel, nil
