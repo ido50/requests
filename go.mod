@@ -1,6 +1,6 @@
 module github.com/ido50/requests
 
-go 1.14
+go 1.16
 
 require (
 	github.com/jgroeneveld/schema v1.0.0 // indirect

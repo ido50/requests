@@ -82,7 +82,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"io/ioutil"
 	"log"
 	"mime/multipart"
 	"net"
@@ -105,6 +104,12 @@ const (
 )
 
 const defaultAuthHeader = "Authorization"
+
+// BodyProcessorFunc is a function that reads a request's body as []byte from a
+// provider reader, and writes it to a provided writer, potentially modifying
+// it in the process. Such a function can be used to modify request bodies right
+// before they are sent.
+type BodyProcessorFunc func(r io.Reader, w io.Writer) error
 
 // CompressionAlgorithm denotes compression algorithms supported by the library
 // for compressed request bodies.
@@ -203,6 +208,10 @@ type HTTPRequest struct {
 	// after optional compression or other processing), and which is read by the
 	// underlying net/http client
 	bodyDst bytes.Buffer
+
+	// bodyProcessorFunc is an optional BodyProcessorFunc to use on when building
+	// the request's body
+	bodyProcessorFunc BodyProcessorFunc
 
 	// pointer to a variable where the response body will be loaded into
 	into interface{}
@@ -523,7 +532,7 @@ func (cli *HTTPClient) retryRequest(
 
 	for attempt := uint8(1); attempt <= attempts; attempt++ {
 		if body != nil {
-			req.Body = ioutil.NopCloser(body)
+			req.Body = io.NopCloser(body)
 		}
 
 		req = req.WithContext(ctx)
@@ -614,11 +623,11 @@ func (req *HTTPRequest) Body(body interface{}, contentType string) *HTTPRequest 
 	if rc, ok := body.(io.ReadCloser); ok {
 		req.bodySrc = rc
 	} else if r, ok := body.(io.Reader); ok {
-		req.bodySrc = ioutil.NopCloser(r)
+		req.bodySrc = io.NopCloser(r)
 	} else if b, ok := body.([]byte); ok {
-		req.bodySrc = ioutil.NopCloser(bytes.NewReader(b))
+		req.bodySrc = io.NopCloser(bytes.NewReader(b))
 	} else if s, ok := body.(string); ok {
-		req.bodySrc = ioutil.NopCloser(strings.NewReader(s))
+		req.bodySrc = io.NopCloser(strings.NewReader(s))
 	} else {
 		req.err = ErrUnsupportedBody
 	}
@@ -683,11 +692,11 @@ func (req *HTTPRequest) MultipartBody(srcs ...*multipartSrc) *HTTPRequest {
 			if rc, ok := src.body.(io.ReadCloser); ok {
 				srcReader = rc
 			} else if r, ok := src.body.(io.Reader); ok {
-				srcReader = ioutil.NopCloser(r)
+				srcReader = io.NopCloser(r)
 			} else if b, ok := src.body.([]byte); ok {
-				srcReader = ioutil.NopCloser(bytes.NewReader(b))
+				srcReader = io.NopCloser(bytes.NewReader(b))
 			} else if s, ok := src.body.(string); ok {
-				srcReader = ioutil.NopCloser(strings.NewReader(s))
+				srcReader = io.NopCloser(strings.NewReader(s))
 			} else {
 				req.err = ErrUnsupportedBody
 				return req
@@ -737,6 +746,15 @@ func MultipartFile(fieldname string, fsys fs.FS, filepath string) *multipartSrc 
 		filesystem: fsys,
 		filepath:   filepath,
 	}
+}
+
+// ReqBodyProcessor adds a BodyProcessorFunc to the request. This function will
+// be called right before the request is issued and can be used to modify the
+// request body. The processor function MUST read AND write the entire body, and
+// should not close it.
+func (req *HTTPRequest) ReqBodyProcessor(fn BodyProcessorFunc) *HTTPRequest {
+	req.bodyProcessorFunc = fn
+	return req
 }
 
 // Accept sets the accepted MIME type for the request. This takes precedence
@@ -1089,6 +1107,8 @@ func (req *HTTPRequest) compress(r *http.Request) error {
 		return nil
 	}
 
+	defer req.bodySrc.Close()
+
 	var compressor io.Writer
 
 	switch alg {
@@ -1106,13 +1126,18 @@ func (req *HTTPRequest) compress(r *http.Request) error {
 		return fmt.Errorf("%w: %q", ErrUnsupportedCompression, alg)
 	}
 
-	tee := io.TeeReader(req.bodySrc, compressor)
+	if req.bodyProcessorFunc != nil {
+		err := req.bodyProcessorFunc(req.bodySrc, compressor)
+		if err != nil {
+			return fmt.Errorf("failed processing body: %w", err)
+		}
+	} else {
+		tee := io.TeeReader(req.bodySrc, compressor)
 
-	defer req.bodySrc.Close()
-
-	_, err := io.ReadAll(tee)
-	if err != nil {
-		return fmt.Errorf("failed compressing body via %s: %w", alg, err)
+		_, err := io.ReadAll(tee)
+		if err != nil {
+			return fmt.Errorf("failed compressing body via %s: %w", alg, err)
+		}
 	}
 
 	if alg != CompressionAlgorithmNone {
@@ -1235,7 +1260,7 @@ func defaultBodyHandler(
 			return fmt.Errorf("invalid target variable: %w", err)
 		}
 
-		data, err := ioutil.ReadAll(body)
+		data, err := io.ReadAll(body)
 		if err != nil {
 			return fmt.Errorf("failed reading server response: %w", err)
 		}
@@ -1337,6 +1362,6 @@ func contains(slice []int, wanted int) bool {
 
 func closeBody(body io.ReadCloser) {
 	// nolint: errcheck
-	io.Copy(ioutil.Discard, body)
+	io.Copy(io.Discard, body)
 	body.Close()
 }

@@ -400,7 +400,7 @@ func TestBodySources(t *testing.T) {
 		},
 		{
 			desc:        "A simple io.ReadCloser",
-			body:        ioutil.NopCloser(bytes.NewReader([]byte("Hello world"))),
+			body:        io.NopCloser(bytes.NewReader([]byte("Hello world"))),
 			contentType: "text/plain",
 			expBody:     "Hello world",
 		},
@@ -542,4 +542,49 @@ func TestMultipartBody(t *testing.T) {
 			Content:   "WORLD",
 		},
 	}, res)
+}
+
+func TestRequestBodyProcessor(t *testing.T) {
+	var body []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		body, err = io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+		} else {
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+
+	defer ts.Close()
+
+	fn := func(r io.Reader, w io.Writer) error {
+		fmt.Fprint(w, `{"items":`)
+		tee := io.TeeReader(r, w)
+		_, err := io.ReadAll(tee)
+		if err != nil {
+			return err
+		}
+		fmt.Fprint(w, `}`)
+		return nil
+	}
+
+	cli := NewClient(ts.URL)
+
+	// First run without the body processor
+	err := cli.NewRequest("POST", "/").
+		JSONBody([]string{"one", "two", "three"}).
+		ExpectedStatus(http.StatusNoContent).
+		Run()
+	assert.MustBeNil(t, err)
+	assert.MustBeEqual(t, `["one","two","three"]`, string(body))
+
+	// Now with the processor
+	err = cli.NewRequest("POST", "/").
+		ReqBodyProcessor(fn).
+		JSONBody([]string{"one", "two", "three"}).
+		ExpectedStatus(http.StatusNoContent).
+		Run()
+	assert.MustBeNil(t, err)
+	assert.MustBeEqual(t, `{"items":["one","two","three"]}`, string(body))
 }
